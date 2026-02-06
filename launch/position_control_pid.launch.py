@@ -51,8 +51,13 @@ def generate_launch_description():
                 "max_torque_z": 0.4,
 
                 # Yaw torque
-                "yaw_kp": 1.5,
-                "yaw_kd": 0.05,
+                "yaw_kp": 0.3,
+                "yaw_kd": 0.2,
+
+                "cmd_vel_topic": f"{ns}/cmd_vel",
+                "cmd_timeout": 0.3,
+                "yaw_sign": -1.0,
+                "z_sign": -1.0,
             }],
         ),
     ])
