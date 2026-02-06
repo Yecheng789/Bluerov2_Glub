@@ -6,7 +6,7 @@ from px4_msgs.msg import OffboardControlMode
 
 class OffboardHeartbeat(Node):
     def __init__(self):
-        super().__init__("offboard_heartbeat")
+        super().__init__("offboard_heartbeat_wrench")
         self.declare_parameter("topic", "/itrl_rov_1/fmu/in/offboard_control_mode")
         topic = self.get_parameter("topic").get_parameter_value().string_value
         self.pub = self.create_publisher(OffboardControlMode, topic, 10)

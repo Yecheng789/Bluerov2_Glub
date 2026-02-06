@@ -1,10 +1,10 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>bluerov2_mpc</name>
+  <name>bluerov2_control</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="viktornfa@gmail.com">notan</maintainer>
+  <description>A ROS2 package for running controllers with the PX4 BlueROV2 and the Gazebo simulator.</description>
+  <maintainer email="viktornfa@gmail.com">Victor Nan Fernandez-Ayala</maintainer>
   <license>MIT</license>
 
   <test_depend>ament_copyright</test_depend>
