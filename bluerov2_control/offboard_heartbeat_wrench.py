@@ -15,7 +15,6 @@ class OffboardHeartbeat(Node):
     def tick(self):
         msg = OffboardControlMode()
         msg.timestamp = int(Clock().now().nanoseconds / 1000)
-        # We use direct_actuator for the PID/MPC
         msg.position = False
         msg.velocity = False
         msg.acceleration = False

@@ -17,6 +17,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/position_control_pid.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/stabilized_control.launch.py']),
         # --- install weights into share/<pkg>/models/weights ---
         ('share/' + package_name + '/models/weights',
             glob('bluerov2_control/models/weights/*.npz')),
@@ -32,6 +33,8 @@ setup(
             'offboard_heartbeat_actuator = bluerov2_control.offboard_heartbeat_actuator:main',
             'offboard_heartbeat_wrench = bluerov2_control.offboard_heartbeat_wrench:main',
             'position_control_pid = bluerov2_control.position_control_pid:main',
+            'stabilized_control = bluerov2_control.stabilized_control:main',
+            'wasd_teleop = bluerov2_control.wasd_teleop:main',
         ],
     },
 )
