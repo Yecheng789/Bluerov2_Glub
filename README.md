@@ -1,4 +1,9 @@
 ## For Stabilized Control:
+For it to work remember to use the appropiate namespace:
+```bas
+PX4_UXRCE_DDS_NS=itrl_rov_1 make px4_sitl_uuv gz_uuv_bluerov2_heavy
+```
+
 ```bash
 cd ~/px4_ws
 colcon build
