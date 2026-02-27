@@ -16,7 +16,7 @@ colcon build
 source install/setup.bash
 
 
-# 1) Launch the nodes (heartbeat + PID)
+# 1) Launch the nodes (heartbeat + stabilized)
 ros2 launch bluerov2_control stabilized_control.launch.py
 
 # 2) In a second terminal run the custom keyboard teleop 
@@ -24,3 +24,19 @@ ros2 run bluerov2_control wasd_teleop
 ```
 
 Also, make sure to arm the vehicle adter you run the controller node.
+
+## For PID Position Control:
+
+Same setup as stabilized Control but run:
+```bash
+cd ~/px4_ws
+colcon build
+source install/setup.bash
+
+
+# 1) Launch the nodes (heartbeat + PID)
+ros2 launch bluerov2_control position_control_pid.launch.py
+
+# 2) In a second terminal run the custom keyboard teleop 
+ros2 run bluerov2_control wasd_teleop
+```

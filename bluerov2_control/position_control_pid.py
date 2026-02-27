@@ -8,8 +8,7 @@ Architecture (matches PX4):
 
 Important:
 - PX4 uuv_pos_control publishes VEHICLE_ATTITUDE_SETPOINT (not thrust/torque directly).
-- Therefore OffboardControlMode should have attitude=True (NOT body_rate=True).
-  If you keep body_rate=True, PX4 will look for VehicleRatesSetpoint instead.
+- Therefore OffboardControlMode should have attitude=True.
 """
 
 import math
@@ -165,8 +164,8 @@ class PositionControlPID(Node):
         # Command hygiene / conventions
         self.declare_parameter("cmd_timeout", 0.3)
         self.declare_parameter("yaw_sign", -1.0)
-        self.declare_parameter("z_sign", -1.0)
-        self.declare_parameter("sway_sign", 1.0)  # set -1 if your 'a/d' are swapped
+        self.declare_parameter("z_sign", 1.0)
+        self.declare_parameter("sway_sign", -1.0)  # set -1 if your 'a/d' are swapped
 
         # Loop timing
         self.declare_parameter("loop_dt", 0.02)  # 50 Hz
@@ -211,12 +210,12 @@ class PositionControlPID(Node):
     # -------- callbacks --------
 
     def on_control_mode(self, msg: VehicleControlMode):
-        # Similar to "armed gate" behavior you already used
+        # Armed gate behaviour from stabilized control
         gate = bool(msg.flag_armed) and bool(msg.flag_control_offboard_enabled)
 
         if gate and not self.enabled:
             self.enabled = True
-            # PX4 resets trajectory setpoint on entry conditions via validity checks; do it explicitly here
+            # PX4 resets trajectory setpoint on entry conditions via validity checks
             if self.have_odom:
                 self.reset_trajectory_setpoint()
             self.get_logger().info("Position controller enabled (armed + offboard).")
@@ -311,7 +310,7 @@ class PositionControlPID(Node):
             roll_sp = 0.0
             pitch_sp = 0.0
         else:
-            # No D-pad/buttons in cmd_vel; keep as-is (or expose separate inputs if needed)
+            # No D-pad/buttons in cmd_vel; keep as-is for now
             # This preserves PX4 structure without inventing new behavior.
             pass
 
@@ -420,7 +419,7 @@ class PositionControlPID(Node):
             self.check_setpoint_validity(now_us)
             self.generate_trajectory_setpoint(dt)
 
-        # altitude_only flag: you can wire this to control_mode flags if you actually use them;
+        # altitude_only flag: can be wired to control_mode flags if used;
         # with offboard+cmd_vel it’s typically full position.
         altitude_only = False
 

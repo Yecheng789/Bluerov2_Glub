@@ -56,7 +56,8 @@ def generate_launch_description():
                 "cmd_vel_topic": f"{ns}/cmd_vel",
                 "cmd_timeout": 0.3,
                 "yaw_sign": -1.0,
-                "z_sign": -1.0,
+                "z_sign": 1.0,
+                "sway_sign": -1.0,
             }],
         ),
     ])
