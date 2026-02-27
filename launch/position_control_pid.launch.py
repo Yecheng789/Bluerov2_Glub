@@ -10,8 +10,8 @@ def generate_launch_description():
         # OffboardControlMode heartbeat
         Node(
             package="bluerov2_control",
-            executable="offboard_heartbeat_wrench",
-            name="offboard_heartbeat_wrench",
+            executable="offboard_heartbeat_attitude",
+            name="offboard_heartbeat_attitude",
             output="screen",
             parameters=[{
                 "topic": f"{ns}/fmu/in/offboard_control_mode",
@@ -27,8 +27,7 @@ def generate_launch_description():
             parameters=[{
                 "odom_topic": f"{ns}/fmu/out/vehicle_odometry",
                 # "odom_topic": "/mocap/itrl_rov_1/odom", # real mocap odom
-                "thrust_sp_topic": f"{ns}/fmu/in/vehicle_thrust_setpoint",
-                "torque_sp_topic": f"{ns}/fmu/in/vehicle_torque_setpoint",
+                "att_sp_topic": f"{ns}/fmu/in/vehicle_attitude_setpoint_v1",
                 "control_mode_topic": f"{ns}/fmu/out/vehicle_control_mode",
 
                 # PX4-like gains

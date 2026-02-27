@@ -32,6 +32,7 @@ setup(
         'console_scripts': [
             'offboard_heartbeat_actuator = bluerov2_control.offboard_heartbeat_actuator:main',
             'offboard_heartbeat_wrench = bluerov2_control.offboard_heartbeat_wrench:main',
+            'offboard_heartbeat_attitude = bluerov2_control.offboard_heartbeat_attitude:main',
             'position_control_pid = bluerov2_control.position_control_pid:main',
             'stabilized_control = bluerov2_control.stabilized_control:main',
             'wasd_teleop = bluerov2_control.wasd_teleop:main',
