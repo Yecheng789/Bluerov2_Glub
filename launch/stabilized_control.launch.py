@@ -36,10 +36,10 @@ def generate_launch_description():
                 "UUV_YAW_P": 2.0,
                 "UUV_YAW_D": 0.5,
 
-                "UUV_SGM_YAW": 0.5,
-                "UUV_SGM_THRTL": 0.1,
-                "UUV_TORQUE_SAT": 0.3,
-                "UUV_THRUST_SAT": 0.1,
+                "UUV_SGM_YAW": 0.7,
+                "UUV_SGM_THRTL": 0.15,
+                "UUV_TORQUE_SAT": 0.4,
+                "UUV_THRUST_SAT": 0.15,
 
                 # 0 = XYZ thrust (heave/sway enabled), 1 = surge-only
                 "UUV_STICK_MODE": 0,
@@ -47,6 +47,7 @@ def generate_launch_description():
                 # Convention knobs
                 "yaw_sign": -1.0,
                 "z_sign": -1.0,
+                "yaw_rate_lpf_hz": 8.0,
 
                 "cmd_timeout": 0.3,
                 "cmd_deadband": 0.05,

@@ -153,6 +153,7 @@ class StabilizedControl(Node):
         # Convention knobs
         self.declare_parameter("yaw_sign", -1.0)
         self.declare_parameter("z_sign", -1.0)
+        self.declare_parameter("yaw_rate_lpf_hz", 5.0)
 
         # Cmd hygiene
         self.declare_parameter("cmd_timeout", 0.3)
@@ -181,6 +182,7 @@ class StabilizedControl(Node):
 
         self.enabled = False
         self.sp_yaw = 0.0
+        self.wz_filt = 0.0
 
         # cmd (“virtual sticks”)
         self.cmd_xyz = (0.0, 0.0, 0.0)
@@ -299,6 +301,14 @@ class StabilizedControl(Node):
         eR_x, eR_y, eR_z = vee_map_skew(e_R)
 
         wx, wy, wz = self.omega_b
+        yaw_rate_lpf_hz = float(self.get_parameter("yaw_rate_lpf_hz").value)
+        if yaw_rate_lpf_hz > 0.0:
+            rc = 1.0 / (2.0 * math.pi * yaw_rate_lpf_hz)
+            alpha = dt / (rc + dt)
+            self.wz_filt = (1.0 - alpha) * self.wz_filt + alpha * wz
+            wz_use = self.wz_filt
+        else:
+            wz_use = wz
 
         roll_p = float(self.get_parameter("UUV_ROLL_P").value)
         pitch_p = float(self.get_parameter("UUV_PITCH_P").value)
@@ -310,7 +320,7 @@ class StabilizedControl(Node):
 
         tau_x = -roll_p * eR_x - roll_d * wx
         tau_y = -pitch_p * eR_y - pitch_d * wy
-        tau_z = -yaw_p * eR_z - yaw_d * wz
+        tau_z = -yaw_p * eR_z - yaw_d * wz_use
 
         torque_sat = float(self.get_parameter("UUV_TORQUE_SAT").value)
         tau_x = clamp(tau_x, -torque_sat, torque_sat)

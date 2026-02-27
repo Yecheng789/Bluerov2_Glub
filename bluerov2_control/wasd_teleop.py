@@ -35,8 +35,6 @@ class WasdTeleop(Node):
 
         self.declare_parameter("cmd_vel_topic", "/itrl_rov_1/cmd_vel")
         self.declare_parameter("rate_hz", 30.0)
-        self.declare_parameter("lin_step", 0.2)   # normalized step per key press
-        self.declare_parameter("yaw_step", 0.4)   # normalized step per key press
 
         self.declare_parameter("lin_scale", 1.0)  # scales linear.*
         self.declare_parameter("yaw_scale", 1.0)  # scales angular.z
@@ -98,9 +96,6 @@ class WasdTeleop(Node):
 
         ch = ch.lower()
 
-        lin_step = float(self.get_parameter("lin_step").value)
-        yaw_step = float(self.get_parameter("yaw_step").value)
-
         if ch == "h":
             self.print_help()
             return
@@ -129,31 +124,35 @@ class WasdTeleop(Node):
             return
 
         # Command mapping (normalized “sticks” in [-1,1])
+        # Reset each tick to avoid sticky mixing
+        cmd = Twist()
+
         if ch == "w":
-            self.cmd.linear.x = clamp(self.cmd.linear.x + lin_step, -1.0, 1.0)
+            cmd.linear.x = 1.0
         elif ch == "s":
-            self.cmd.linear.x = clamp(self.cmd.linear.x - lin_step, -1.0, 1.0)
+            cmd.linear.x = -1.0
         elif ch == "a":
-            self.cmd.linear.y = clamp(self.cmd.linear.y + lin_step, -1.0, 1.0)
+            cmd.linear.y = 1.0
         elif ch == "d":
-            self.cmd.linear.y = clamp(self.cmd.linear.y - lin_step, -1.0, 1.0)
+            cmd.linear.y = -1.0
         elif ch == "r":
-            self.cmd.linear.z = clamp(self.cmd.linear.z + lin_step, -1.0, 1.0)
+            cmd.linear.z = 1.0
         elif ch == "f":
-            self.cmd.linear.z = clamp(self.cmd.linear.z - lin_step, -1.0, 1.0)
+            cmd.linear.z = -1.0
         elif ch == "q":
-            self.cmd.angular.z = clamp(self.cmd.angular.z + yaw_step, -1.0, 1.0)
+            cmd.angular.z = 1.0
         elif ch == "e":
-            self.cmd.angular.z = clamp(self.cmd.angular.z - yaw_step, -1.0, 1.0)
+            cmd.angular.z = -1.0
         else:
             return
 
         # Apply scales and publish
         msg = Twist()
-        msg.linear.x = clamp(self.cmd.linear.x * self.lin_scale, -1.0, 1.0)
-        msg.linear.y = clamp(self.cmd.linear.y * self.lin_scale, -1.0, 1.0)
-        msg.linear.z = clamp(self.cmd.linear.z * self.lin_scale, -1.0, 1.0)
-        msg.angular.z = clamp(self.cmd.angular.z * self.yaw_scale, -1.0, 1.0)
+        
+        msg.linear.x = clamp(cmd.linear.x * self.lin_scale, -1.0, 1.0)
+        msg.linear.y = clamp(cmd.linear.y * self.lin_scale, -1.0, 1.0)
+        msg.linear.z = clamp(cmd.linear.z * self.lin_scale, -1.0, 1.0)
+        msg.angular.z = clamp(cmd.angular.z * self.yaw_scale, -1.0, 1.0)
 
         self.pub.publish(msg)
 
