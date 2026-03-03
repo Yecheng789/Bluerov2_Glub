@@ -93,19 +93,26 @@ class MPCHoldPosition(Node):
         self.declare_parameter("w_yaw", 5.0)
         self.declare_parameter("w_omega", 0.2)
         self.declare_parameter("w_u_force", 0.1)
-        self.declare_parameter("w_u_torque", 0.0)  # unused (torque forced to 0)
+        self.declare_parameter("w_u_torque", 0.05)
 
         # ---------------- Physical bounds (Newtons / N*m) ----------------
-        # MPC decides forces in N. We later normalize for PX4.
+        # MPC decides forces in N/Nm. We later normalize for PX4.
         self.declare_parameter("Fx_max_N", 20.0)
         self.declare_parameter("Fy_max_N", 20.0)
         self.declare_parameter("Fz_max_N", 30.0)
+        self.declare_parameter("Mz_max_Nm", 0.2)   # start small
+        self.declare_parameter("Mx_max_Nm", 0.0)   # keep roll torque disabled initially
+        self.declare_parameter("My_max_Nm", 0.0)   # keep pitch torque disabled initially
 
         # ---------------- Publish scaling / saturation ----------------
         # Convert Newtons -> normalized:
         #   thrust_norm = F_N / F_max_N
         # then clamp to +-thrust_sat (like your stabilized controller ranges)
         self.declare_parameter("thrust_sat", 0.15)
+        self.declare_parameter("torque_sat_Nm", 0.2)
+
+        # Torque command holder
+        self.u_tau_cmd_Nm = np.zeros(3)   # [Mx, My, Mz]
 
         # Safety / publishing
         self.declare_parameter("publish_dt", 0.02)
@@ -140,7 +147,7 @@ class MPCHoldPosition(Node):
         self.w0 = None  # warm start
         self.u_force_cmd_N = np.zeros(3)  # hold between solves (Newtons)
 
-        self._build_mpc_translation_only()
+        self._build_mpc()
 
         self.solve_timer = self.create_timer(
             1.0 / float(self.get_parameter("solve_rate_hz").value), self.solve_tick
@@ -182,17 +189,17 @@ class MPCHoldPosition(Node):
                 f"v_b=[{self.v_b[0]:.3f},{self.v_b[1]:.3f},{self.v_b[2]:.3f}] yaw={yaw:.3f} rad"
             )
 
-    # ---------------- MPC build (translation only) ----------------
+    # -------------------- MPC build --------------------
 
-    def _build_mpc_translation_only(self):
+    def _build_mpc(self):
         Ts = float(self.get_parameter("Ts").value)
         N = int(self.get_parameter("N").value)
 
         m = float(self.get_parameter("mass").value)
+        Ix = float(self.get_parameter("Ix").value)
+        Iy = float(self.get_parameter("Iy").value)
+        Iz = float(self.get_parameter("Iz").value)
 
-        # We keep the same 13-state structure but we will:
-        # - ignore attitude dynamics in the cost (unless hold_yaw)
-        # - force torques to 0 by not optimizing them at all
         # Decision variables: X(13,N+1), F(3,N)
         x = ca.SX.sym("x", 13)
         p = x[0:3]
@@ -200,7 +207,9 @@ class MPCHoldPosition(Node):
         v = x[7:10]
         w = x[10:13]
 
-        F = ca.SX.sym("F", 3)
+        u = ca.SX.sym("u", 6)
+        F = u[0:3]
+        tau = u[3:6]
 
         # Rotation matrix R(q) body->world (scalar-first)
         qw, qx, qy, qz = q[0], q[1], q[2], q[3]
@@ -215,7 +224,7 @@ class MPCHoldPosition(Node):
         R[2, 1] = 2 * (qy * qz + qx * qw)
         R[2, 2] = 1 - 2 * (qx * qx + qy * qy)
 
-        # Quaternion derivative using body rates w (we just propagate it; torque=0 means w is constant)
+        # Quaternion derivative using body rates w
         wx, wy, wz = w[0], w[1], w[2]
         qdot = ca.vertcat(
             0.5 * (-qx * wx - qy * wy - qz * wz),
@@ -228,19 +237,31 @@ class MPCHoldPosition(Node):
         pdot = R @ v
         vdot = (1.0 / m) * F
 
-        # Rotation dynamics disabled (no torque): wdot = 0
-        wdot = ca.SX.zeros(3, 1)
+        # Rotation dynamics
+        J = ca.diag(ca.vertcat(Ix, Iy, Iz))
+        Jinv = ca.diag(ca.vertcat(1.0/Ix, 1.0/Iy, 1.0/Iz))
+
+        Jw = J @ w  # 3x1
+
+        # cross(w, Jw)
+        w_cross_Jw = ca.vertcat(
+            w[1]*Jw[2] - w[2]*Jw[1],
+            w[2]*Jw[0] - w[0]*Jw[2],
+            w[0]*Jw[1] - w[1]*Jw[0],
+        )
+
+        wdot = Jinv @ (tau - w_cross_Jw)
 
         xdot = ca.vertcat(pdot, qdot, vdot, wdot)
-        xdot_fun = ca.Function("xdot", [x, F], [xdot])
+        xdot_fun = ca.Function("xdot", [x, u], [xdot])
 
-        def rk4(xk, Fk):
-            k1 = xdot_fun(xk, Fk)
-            k2 = xdot_fun(xk + 0.5 * Ts * k1, Fk)
-            k3 = xdot_fun(xk + 0.5 * Ts * k2, Fk)
-            k4 = xdot_fun(xk + Ts * k3, Fk)
+        def rk4(xk, uk):
+            k1 = xdot_fun(xk, uk)
+            k2 = xdot_fun(xk + 0.5 * Ts * k1, uk)
+            k3 = xdot_fun(xk + 0.5 * Ts * k2, uk)
+            k4 = xdot_fun(xk + Ts * k3, uk)
             xkp1 = xk + (Ts / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-            # renormalize quaternion
+
             qn = xkp1[3:7]
             qn = qn / ca.sqrt(ca.dot(qn, qn) + 1e-12)
             return ca.vertcat(xkp1[0:3], qn, xkp1[7:13])
@@ -254,12 +275,13 @@ class MPCHoldPosition(Node):
         hold_yaw_flag = P[17]
 
         X = ca.SX.sym("X", 13, N + 1)
-        U = ca.SX.sym("U", 3, N)  # forces only
+        U = ca.SX.sym("U", 6, N) # forces and torques
 
         w_pos = float(self.get_parameter("w_pos").value)
         w_vel = float(self.get_parameter("w_vel").value)
         w_yaw = float(self.get_parameter("w_yaw").value)
         w_u_force = float(self.get_parameter("w_u_force").value)
+        w_u_torque = float(self.get_parameter("w_u_torque").value)
 
         cost = 0
         g = []
@@ -268,17 +290,22 @@ class MPCHoldPosition(Node):
 
         for k in range(N):
             xk = X[:, k]
-            Fk = U[:, k]
+            uk = U[:, k]
+            Fk = uk[0:3]
+            tauk = uk[3:6]
             xk1 = X[:, k + 1]
-            g.append(xk1 - rk4(xk, Fk))
+            g.append(xk1 - rk4(xk, uk))
 
             pk = xk[0:3]
             vk = xk[7:10]
+            wk = xk[10:13]
 
             pos_err = pk - pref
             cost += w_pos * ca.dot(pos_err, pos_err)
             cost += w_vel * ca.dot(vk, vk)
             cost += w_u_force * ca.dot(Fk, Fk)
+            cost += float(self.get_parameter("w_omega").value) * ca.dot(wk, wk)
+            cost += w_u_torque * ca.dot(tauk, tauk)
 
             # optional yaw hold (still cheap, doesn’t command torque though)
             qk = xk[3:7]
@@ -310,19 +337,25 @@ class MPCHoldPosition(Node):
         Fy_max_N = float(self.get_parameter("Fy_max_N").value)
         Fz_max_N = float(self.get_parameter("Fz_max_N").value)
 
+        Mx_max_Nm = float(self.get_parameter("Mx_max_Nm").value)
+        My_max_Nm = float(self.get_parameter("My_max_Nm").value)
+        Mz_max_Nm = float(self.get_parameter("Mz_max_Nm").value)
+
         nx = 13 * (N + 1)
-        nu = 3 * N
+        nu = 6 * N
         lbx = -1e9 * np.ones(nx + nu)
-        ubx = 1e9 * np.ones(nx + nu)
+        ubx =  1e9 * np.ones(nx + nu)
 
         for k in range(N):
-            idx = nx + 3 * k
-            lbx[idx + 0] = -Fx_max_N
-            ubx[idx + 0] = Fx_max_N
-            lbx[idx + 1] = -Fy_max_N
-            ubx[idx + 1] = Fy_max_N
-            lbx[idx + 2] = -Fz_max_N
-            ubx[idx + 2] = Fz_max_N
+            idx = nx + 6*k
+            # Forces
+            lbx[idx+0] = -Fx_max_N;  ubx[idx+0] = Fx_max_N
+            lbx[idx+1] = -Fy_max_N;  ubx[idx+1] = Fy_max_N
+            lbx[idx+2] = -Fz_max_N;  ubx[idx+2] = Fz_max_N
+            # Torques
+            lbx[idx+3] = -Mx_max_Nm; ubx[idx+3] = Mx_max_Nm
+            lbx[idx+4] = -My_max_Nm; ubx[idx+4] = My_max_Nm
+            lbx[idx+5] = -Mz_max_Nm; ubx[idx+5] = Mz_max_Nm
 
         ng = int(g_dec.size1())
         self.lbg = np.zeros(ng)
@@ -399,9 +432,9 @@ class MPCHoldPosition(Node):
         N = int(self.get_parameter("N").value)
         nx = 13 * (N + 1)
 
-        # First force command
-        F0 = w_opt[nx : nx + 3]
-        self.u_force_cmd_N = np.array(F0, dtype=float)
+        u0 = w_opt[nx : nx + 6]
+        self.u_force_cmd_N = np.array(u0[0:3], dtype=float)
+        self.u_tau_cmd_Nm  = np.array(u0[3:6], dtype=float)
 
     def publish_zero(self):
         now_us = int(self.get_clock().now().nanoseconds / 1000)
@@ -446,11 +479,15 @@ class MPCHoldPosition(Node):
         thr.xyz = [float(thr_norm[0]), float(thr_norm[1]), float(thr_norm[2])]
         self.pub_thrust.publish(thr)
 
-        # Auxiliary torque held at zero always (until translation is correct)
+        torque_sat = float(self.get_parameter("torque_sat_Nm").value)
+        Mx = float(clamp(self.u_tau_cmd_Nm[0], -torque_sat, torque_sat))
+        My = float(clamp(self.u_tau_cmd_Nm[1], -torque_sat, torque_sat))
+        Mz = float(clamp(self.u_tau_cmd_Nm[2], -torque_sat, torque_sat))
+
         tor = VehicleTorqueSetpoint()
         tor.timestamp = now_us
         tor.timestamp_sample = 0
-        tor.xyz = [0.0, 0.0, 0.0]
+        tor.xyz = [Mx, My, Mz]
         self.pub_torque.publish(tor)
 
 

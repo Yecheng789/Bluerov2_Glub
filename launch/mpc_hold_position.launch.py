@@ -33,7 +33,7 @@ def generate_launch_description():
                 "goal_x": -1.15,
                 "goal_y": -2.175,
                 "goal_z": 95.7,
-                "hold_yaw": False,
+                "hold_yaw": True,
                 "yaw_goal": 0.0,
 
                 # MPC settings
@@ -55,10 +55,13 @@ def generate_launch_description():
                 "w_u_force": 0.1,
                 "w_u_torque": 0.0,
 
-                # Physical force bounds (Newtons) used by MPC + normalization
-                "Fx_max_N": 20.0,
-                "Fy_max_N": 20.0,
-                "Fz_max_N": 30.0,
+                # Physical force bounds (Newtons/Nm) used by MPC + normalization
+                "Fx_max_N": 88.0,
+                "Fy_max_N": 88.0,
+                "Fz_max_N": 137.0,
+                "Mz_max_Nm": 0.2,
+                "Mx_max_Nm": 0.0,
+                "My_max_Nm": 0.0,
 
                 # Published normalized thrust clamp (keep small initially)
                 "thrust_sat": 0.15,
