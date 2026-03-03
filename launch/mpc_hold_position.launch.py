@@ -24,6 +24,7 @@ def generate_launch_description():
             parameters=[{
                 # Topics
                 "odom_topic": f"{ns}/fmu/out/vehicle_odometry",
+                # "odom_topic": "/mocap/itrl_rov_1/odom", # real mocap odom
                 "control_mode_topic": f"{ns}/fmu/out/vehicle_control_mode",
                 "thrust_sp_topic": f"{ns}/fmu/in/vehicle_thrust_setpoint",
                 "torque_sp_topic": f"{ns}/fmu/in/vehicle_torque_setpoint",
@@ -35,18 +36,10 @@ def generate_launch_description():
                 "hold_yaw": False,
                 "yaw_goal": 0.0,
 
-                # If sway/depth are inverted, flip these (only affects THIS node)
-                # examples:
-                #   right goes left -> set sign_y := -1.0
-                #   up/down inverted -> set sign_z := -1.0 (remember: z is DOWN-positive in NED)
-                "sign_x": 1.0,
-                "sign_y": 1.0,
-                "sign_z": 1.0,
-
                 # MPC settings
                 "Ts": 0.10,
                 "N": 15,
-                "solve_rate_hz": 10.0,
+                "solve_rate_hz": 20.0,
 
                 # Model
                 "mass": 13.5,
@@ -72,11 +65,6 @@ def generate_launch_description():
 
                 # Publish rate
                 "publish_dt": 0.02,
-
-                # Axis test (set True to validate directions)
-                "axis_test_enable": False,
-                "axis_test_axis": "x",
-                "axis_test_force_N": 5.0,
             }],
         ),
     ])

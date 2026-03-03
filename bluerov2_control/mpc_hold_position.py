@@ -1,26 +1,16 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-MPCHoldPosition (safe baseline):
+MPCHoldPosition (double integrator dynamics):
 
-Implements fixes 1-5:
-
-1) Use ONLY /fmu/out/vehicle_odometry as state (no local_pos dependency).
-2) Use tank center in PX4-local NED coordinates by default:
+Uses tank center in PX4-local NED coordinates as goal by default:
      world ENU center from SDF water box:
        (E, N, U) = (-2.175, -1.15, -95.7)
      converted to PX4 NED:
        (N, E, D) = (-1.15, -2.175, 95.7)
 
-3) Start with TRANSLATION ONLY: publish torque = 0 always (no spinning while you validate frames/scaling).
-4) Explicit physical->normalized scaling:
+Explicit physical->normalized scaling:
      - MPC decides in Newtons (Fx,Fy,Fz)
      - we publish normalized thrust setpoints = F / F_max_N
    and clamp to [-thrust_sat, +thrust_sat].
-
-5) Built-in "axis test" mode:
-     set axis_test_enable:=True and choose axis_test_axis in {x,y,z}
-     and axis_test_force_N to apply a constant force and verify directions.
 """
 
 import math
@@ -86,13 +76,6 @@ class MPCHoldPosition(Node):
         self.declare_parameter("hold_yaw", False)  # start with False (safer)
         self.declare_parameter("yaw_goal", 0.0)
 
-        # ---------------- Frame/sign knobs (Fix sway/depth confusion) ----------------
-        # These are applied to PUBLISHED thrust setpoints (normalized).
-        # Start with all +1, then flip as needed.
-        self.declare_parameter("sign_x", 1.0)  # surge
-        self.declare_parameter("sign_y", 1.0)  # sway
-        self.declare_parameter("sign_z", 1.0)  # heave (remember: PX4 NED has +z = down)
-
         # ---------------- MPC settings ----------------
         self.declare_parameter("Ts", 0.10)
         self.declare_parameter("N", 15)
@@ -126,11 +109,6 @@ class MPCHoldPosition(Node):
 
         # Safety / publishing
         self.declare_parameter("publish_dt", 0.02)
-
-        # ---------------- Axis test mode (Fix #5) ----------------
-        self.declare_parameter("axis_test_enable", False)
-        self.declare_parameter("axis_test_axis", "x")      # "x"|"y"|"z"
-        self.declare_parameter("axis_test_force_N", 5.0)   # constant force command in N
 
         # ---------------- ROS wiring ----------------
         odom_topic = self.get_parameter("odom_topic").value
@@ -400,20 +378,6 @@ class MPCHoldPosition(Node):
         if not self.enabled or not self.have_odom or self.solver is None:
             return
 
-        # Axis-test bypass: constant force (in N) to validate directions
-        if bool(self.get_parameter("axis_test_enable").value):
-            axis = str(self.get_parameter("axis_test_axis").value).lower()
-            fN = float(self.get_parameter("axis_test_force_N").value)
-            F = np.zeros(3)
-            if axis == "x":
-                F[0] = fN
-            elif axis == "y":
-                F[1] = fN
-            elif axis == "z":
-                F[2] = fN
-            self.u_force_cmd_N = F
-            return
-
         P = self._p_vec()
 
         try:
@@ -463,11 +427,7 @@ class MPCHoldPosition(Node):
         # Convert N -> normalized thrust
         thr_norm = self._forceN_to_thrust_norm(self.u_force_cmd_N)
 
-        # Apply sign knobs (fix swapped axes)
-        sx = float(self.get_parameter("sign_x").value)
-        sy = float(self.get_parameter("sign_y").value)
-        sz = float(self.get_parameter("sign_z").value)
-        thr_norm = np.array([sx * thr_norm[0], sy * thr_norm[1], sz * thr_norm[2]], dtype=float)
+        thr_norm = np.array([thr_norm[0], thr_norm[1], thr_norm[2]], dtype=float)
 
         # Clamp to "stabilized-like" saturation
         thrust_sat = float(self.get_parameter("thrust_sat").value)
@@ -486,7 +446,7 @@ class MPCHoldPosition(Node):
         thr.xyz = [float(thr_norm[0]), float(thr_norm[1]), float(thr_norm[2])]
         self.pub_thrust.publish(thr)
 
-        # Fix #3: torque held at zero always (until translation is correct)
+        # Auxiliary torque held at zero always (until translation is correct)
         tor = VehicleTorqueSetpoint()
         tor.timestamp = now_us
         tor.timestamp_sample = 0
