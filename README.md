@@ -6,7 +6,7 @@ PX4_UXRCE_DDS_NS=itrl_rov_1 make px4_sitl_uuv gz_uuv_bluerov2_heavy
 
 You can also try it in the KTH tank environment with:
 ```bash
-PX4_UXRCE_DDS_NS=itrl_rov_1 PX4_GZ_WORLD=kthtanklab make px4_sitl_uuv gz_uuv_bluerov2_heavy
+PX4_UXRCE_DDS_NS=itrl_rov_1 PX4_GZ_WORLD=kth_marinarium make px4_sitl_uuv gz_uuv_bluerov2_heavy
 ```
 
 Remember to run the Micro-XRCE-DDS-Agent:
