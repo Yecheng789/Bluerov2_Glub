@@ -10,7 +10,7 @@ Uses tank center in PX4-local NED coordinates as goal by default:
 Explicit physical->normalized scaling:
      - MPC decides in Newtons (Fx,Fy,Fz)
      - we publish normalized thrust setpoints = F / F_max_N
-   and clamp to [-thrust_sat, +thrust_sat].
+   and clamp to [-thrust_sat, +thrust_sat]. Same for torques.
 """
 
 import math
@@ -50,6 +50,22 @@ def quat_to_yaw_wxyz(q):
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def euler_to_quat_wxyz(roll, pitch, yaw):
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+
+    return quat_norm_wxyz((qw, qx, qy, qz))
+
+
 class MPCHoldPosition(Node):
     def __init__(self):
         super().__init__("mpc_hold_position")
@@ -73,8 +89,12 @@ class MPCHoldPosition(Node):
         self.declare_parameter("goal_x", -1.15)    # N
         self.declare_parameter("goal_y", -2.175)   # E
         self.declare_parameter("goal_z", 95.7)     # D (down-positive)
-        self.declare_parameter("hold_yaw", False)  # start with False (safer)
-        self.declare_parameter("yaw_goal", 0.0)
+        
+        self.declare_parameter("goal_roll", 0.0)
+        self.declare_parameter("goal_pitch", 0.0)
+        self.declare_parameter("goal_yaw", 0.0)
+
+        self.declare_parameter("hold_attitude", True)
 
         # ---------------- MPC settings ----------------
         self.declare_parameter("Ts", 0.10)
@@ -90,7 +110,7 @@ class MPCHoldPosition(Node):
         # ---------------- Weights ----------------
         self.declare_parameter("w_pos", 50.0)
         self.declare_parameter("w_vel", 5.0)
-        self.declare_parameter("w_yaw", 5.0)
+        self.declare_parameter("w_att", 8.0)
         self.declare_parameter("w_omega", 0.2)
         self.declare_parameter("w_u_force", 0.1)
         self.declare_parameter("w_u_torque", 0.05)
@@ -109,7 +129,7 @@ class MPCHoldPosition(Node):
         #   thrust_norm = F_N / F_max_N
         # then clamp to +-thrust_sat (like your stabilized controller ranges)
         self.declare_parameter("thrust_sat", 0.15)
-        self.declare_parameter("torque_sat_Nm", 0.2)
+        self.declare_parameter("torque_sat", 0.15)
 
         # Torque command holder
         self.u_tau_cmd_Nm = np.zeros(3)   # [Mx, My, Mz]
@@ -138,6 +158,13 @@ class MPCHoldPosition(Node):
 
         self.enabled = False
 
+        # ---------------- Goal ----------------
+        self.q_goal = euler_to_quat_wxyz(
+            float(self.get_parameter("goal_roll").value),
+            float(self.get_parameter("goal_pitch").value),
+            float(self.get_parameter("goal_yaw").value),
+        )
+
         # ---------------- MPC internals ----------------
         self.solver = None
         self.lbx = None
@@ -160,7 +187,7 @@ class MPCHoldPosition(Node):
         gate = bool(msg.flag_armed) and bool(msg.flag_control_offboard_enabled)
         if gate and not self.enabled:
             self.enabled = True
-            if self.have_odom and bool(self.get_parameter("hold_yaw").value):
+            if self.have_odom and bool(self.get_parameter("hold_attitude").value):
                 # optional: lock yaw at current yaw if yaw_goal not set explicitly
                 pass
             self.get_logger().info("MPC enabled (armed + offboard).")
@@ -266,20 +293,19 @@ class MPCHoldPosition(Node):
             qn = qn / ca.sqrt(ca.dot(qn, qn) + 1e-12)
             return ca.vertcat(xkp1[0:3], qn, xkp1[7:13])
 
-        # Parameters:
-        #   x0(13) + pref(3) + yaw_ref(1) + hold_yaw_flag(1)
-        P = ca.SX.sym("P", 18)
+        # Parameters
+        P = ca.SX.sym("P", 21)
         x0 = P[0:13]
         pref = P[13:16]
-        yaw_ref = P[16]
-        hold_yaw_flag = P[17]
+        qref = P[16:20]
+        hold_att_flag = P[20]
 
         X = ca.SX.sym("X", 13, N + 1)
         U = ca.SX.sym("U", 6, N) # forces and torques
 
         w_pos = float(self.get_parameter("w_pos").value)
         w_vel = float(self.get_parameter("w_vel").value)
-        w_yaw = float(self.get_parameter("w_yaw").value)
+        w_att = float(self.get_parameter("w_att").value)
         w_u_force = float(self.get_parameter("w_u_force").value)
         w_u_torque = float(self.get_parameter("w_u_torque").value)
 
@@ -307,18 +333,19 @@ class MPCHoldPosition(Node):
             cost += float(self.get_parameter("w_omega").value) * ca.dot(wk, wk)
             cost += w_u_torque * ca.dot(tauk, tauk)
 
-            # optional yaw hold (still cheap, doesn’t command torque though)
             qk = xk[3:7]
-            qw_k, qx_k, qy_k, qz_k = qk[0], qk[1], qk[2], qk[3]
-            siny = 2 * (qw_k * qz_k + qx_k * qy_k)
-            cosy = 1 - 2 * (qy_k * qy_k + qz_k * qz_k)
-            yaw_k = ca.atan2(siny, cosy)
-            yaw_err = ca.atan2(ca.sin(yaw_k - yaw_ref), ca.cos(yaw_k - yaw_ref))
-            cost += (hold_yaw_flag * w_yaw) * (yaw_err * yaw_err)
+            dot_q = ca.dot(qk, qref)
+            att_err_cost = 1.0 - dot_q * dot_q
+            cost += hold_att_flag * w_att * att_err_cost
 
         pN = X[0:3, N]
         pos_err_N = pN - pref
         cost += (2.0 * w_pos) * ca.dot(pos_err_N, pos_err_N)
+
+        qN = X[3:7, N]
+        dot_qN = ca.dot(qN, qref)
+        att_err_cost_N = 1.0 - dot_qN * dot_qN
+        cost += hold_att_flag * (2.0 * w_att) * att_err_cost_N
 
         w_dec = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))
         g_dec = ca.vertcat(*g)
@@ -377,20 +404,18 @@ class MPCHoldPosition(Node):
         return x
 
     def _p_vec(self):
-        goal = np.array(
-            [
-                float(self.get_parameter("goal_x").value),
-                float(self.get_parameter("goal_y").value),
-                float(self.get_parameter("goal_z").value),
-            ],
-            dtype=float,
-        )
-        yaw_goal = float(self.get_parameter("yaw_goal").value)
-        hold_yaw = bool(self.get_parameter("hold_yaw").value)
-        hold_yaw_flag = 1.0 if hold_yaw else 0.0
+        goal = np.array([
+            float(self.get_parameter("goal_x").value),
+            float(self.get_parameter("goal_y").value),
+            float(self.get_parameter("goal_z").value),
+        ], dtype=float)
+
+        att_goal = np.array(self.q_goal, dtype=float)
+
+        hold_att_flag = 1.0 if bool(self.get_parameter("hold_attitude").value) else 0.0
 
         x0 = self._x_meas()
-        return np.concatenate([x0, goal, np.array([yaw_goal, hold_yaw_flag], dtype=float)])
+        return np.concatenate([x0, goal, att_goal, np.array([hold_att_flag], dtype=float)])
 
     def _forceN_to_thrust_norm(self, F_N):
         # Newtons -> normalized using per-axis maxima
@@ -404,6 +429,22 @@ class MPCHoldPosition(Node):
         Fz_max_N = max(Fz_max_N, 1e-6)
 
         return np.array([F_N[0] / Fx_max_N, F_N[1] / Fy_max_N, F_N[2] / Fz_max_N], dtype=float)
+    
+    def _torqueNm_to_torque_norm(self, tau_Nm):
+        Mx_max_Nm = float(self.get_parameter("Mx_max_Nm").value)
+        My_max_Nm = float(self.get_parameter("My_max_Nm").value)
+        Mz_max_Nm = float(self.get_parameter("Mz_max_Nm").value)
+
+        # avoid div0
+        Mx_max_Nm = max(Mx_max_Nm, 1e-6)
+        My_max_Nm = max(My_max_Nm, 1e-6)
+        Mz_max_Nm = max(Mz_max_Nm, 1e-6)
+
+        return np.array([
+            tau_Nm[0] / Mx_max_Nm,
+            tau_Nm[1] / My_max_Nm,
+            tau_Nm[2] / Mz_max_Nm,
+        ], dtype=float)
 
     # ---------------- runtime ----------------
 
@@ -479,15 +520,20 @@ class MPCHoldPosition(Node):
         thr.xyz = [float(thr_norm[0]), float(thr_norm[1]), float(thr_norm[2])]
         self.pub_thrust.publish(thr)
 
-        torque_sat = float(self.get_parameter("torque_sat_Nm").value)
-        Mx = float(clamp(self.u_tau_cmd_Nm[0], -torque_sat, torque_sat))
-        My = float(clamp(self.u_tau_cmd_Nm[1], -torque_sat, torque_sat))
-        Mz = float(clamp(self.u_tau_cmd_Nm[2], -torque_sat, torque_sat))
+        # Convert Nm -> normalized torque
+        tau_norm = self._torqueNm_to_torque_norm(self.u_tau_cmd_Nm)
+
+        torque_sat = float(self.get_parameter("torque_sat").value)
+        tau_norm = np.array([
+            clamp(tau_norm[0], -torque_sat, torque_sat),
+            clamp(tau_norm[1], -torque_sat, torque_sat),
+            clamp(tau_norm[2], -torque_sat, torque_sat),
+        ], dtype=float)
 
         tor = VehicleTorqueSetpoint()
         tor.timestamp = now_us
         tor.timestamp_sample = 0
-        tor.xyz = [Mx, My, Mz]
+        tor.xyz = [float(tau_norm[0]), float(tau_norm[1]), float(tau_norm[2])]
         self.pub_torque.publish(tor)
 
 

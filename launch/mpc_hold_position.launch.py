@@ -33,38 +33,41 @@ def generate_launch_description():
                 "goal_x": -1.15,
                 "goal_y": -2.175,
                 "goal_z": 95.7,
-                "hold_yaw": True,
-                "yaw_goal": 0.0,
+                "goal_roll": 0.0,
+                "goal_pitch": 0.0,
+                "goal_yaw": 0.0,
+                "hold_attitude": True,
 
                 # MPC settings
-                "Ts": 0.10,
-                "N": 15,
-                "solve_rate_hz": 20.0,
+                "Ts": 0.04,
+                "N": 25,
+                "solve_rate_hz": 25.0,
 
                 # Model
-                "mass": 13.5,
-                "Ix": 0.26,
-                "Iy": 0.23,
-                "Iz": 0.37,
+                "mass": 13.0,
+                "Ix": 0.25,
+                "Iy": 0.221,
+                "Iz": 0.356,
 
                 # Weights
                 "w_pos": 50.0,
-                "w_vel": 5.0,
-                "w_yaw": 5.0,
-                "w_omega": 0.2,
+                "w_vel": 15.0,
+                "w_att": 8.0,
+                "w_omega": 1.0,
                 "w_u_force": 0.1,
-                "w_u_torque": 0.0,
+                "w_u_torque": 0.05,
 
                 # Physical force bounds (Newtons/Nm) used by MPC + normalization
                 "Fx_max_N": 88.0,
                 "Fy_max_N": 88.0,
                 "Fz_max_N": 137.0,
-                "Mz_max_Nm": 0.2,
-                "Mx_max_Nm": 0.0,
-                "My_max_Nm": 0.0,
+                "Mx_max_Nm": 30.0,
+                "My_max_Nm": 16.5,
+                "Mz_max_Nm": 21.0,
 
-                # Published normalized thrust clamp (keep small initially)
-                "thrust_sat": 0.15,
+                # Published normalized thrust and torque clamp
+                "thrust_sat": 0.2,
+                "torque_sat": 0.2,
 
                 # Publish rate
                 "publish_dt": 0.02,
