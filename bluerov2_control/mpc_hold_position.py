@@ -1,5 +1,5 @@
 """
-MPCHoldPosition (double integrator dynamics):
+MPCHoldPosition 6DoF:
 
 Uses tank center in PX4-local NED coordinates as goal by default:
      world ENU center from SDF water box:
@@ -27,6 +27,8 @@ from px4_msgs.msg import (
     VehicleThrustSetpoint,
     VehicleTorqueSetpoint,
 )
+
+from bluerov2_control.models.fossen_bluerov2_model import build_bluerov2_fossen_model
 
 import casadi as ca
 
@@ -101,7 +103,10 @@ class MPCHoldPosition(Node):
         self.declare_parameter("N", 15)
         self.declare_parameter("solve_rate_hz", 10.0)
 
-        # ---------------- Model params (free-flyer baseline) ----------------
+        # ---------------- Model selector ----------------
+        self.declare_parameter("model_type", "double_integrator")
+
+        # ---------------- Model params (only for double_integrator) ----------------
         self.declare_parameter("mass", 13.5)
         self.declare_parameter("Ix", 0.26)
         self.declare_parameter("Iy", 0.23)
@@ -176,6 +181,10 @@ class MPCHoldPosition(Node):
 
         self._build_mpc()
 
+        self.get_logger().info(
+            f"MPC model_type = {str(self.get_parameter('model_type').value)}"
+        )
+
         self.solve_timer = self.create_timer(
             1.0 / float(self.get_parameter("solve_rate_hz").value), self.solve_tick
         )
@@ -222,76 +231,79 @@ class MPCHoldPosition(Node):
         Ts = float(self.get_parameter("Ts").value)
         N = int(self.get_parameter("N").value)
 
-        m = float(self.get_parameter("mass").value)
-        Ix = float(self.get_parameter("Ix").value)
-        Iy = float(self.get_parameter("Iy").value)
-        Iz = float(self.get_parameter("Iz").value)
+        model_type = str(self.get_parameter("model_type").value).strip().lower()
 
-        # Decision variables: X(13,N+1), F(3,N)
-        x = ca.SX.sym("x", 13)
-        p = x[0:3]
-        q = x[3:7]
-        v = x[7:10]
-        w = x[10:13]
+        if model_type == "fossen":
+            x, u, _, rk4_fun = build_bluerov2_fossen_model(Ts)
 
-        u = ca.SX.sym("u", 6)
-        F = u[0:3]
-        tau = u[3:6]
+            def rk4(xk, uk):
+                return rk4_fun(xk, uk)
 
-        # Rotation matrix R(q) body->world (scalar-first)
-        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
-        R = ca.SX(3, 3)
-        R[0, 0] = 1 - 2 * (qy * qy + qz * qz)
-        R[0, 1] = 2 * (qx * qy - qz * qw)
-        R[0, 2] = 2 * (qx * qz + qy * qw)
-        R[1, 0] = 2 * (qx * qy + qz * qw)
-        R[1, 1] = 1 - 2 * (qx * qx + qz * qz)
-        R[1, 2] = 2 * (qy * qz - qx * qw)
-        R[2, 0] = 2 * (qx * qz - qy * qw)
-        R[2, 1] = 2 * (qy * qz + qx * qw)
-        R[2, 2] = 1 - 2 * (qx * qx + qy * qy)
+        else:
+            # default: existing double-integrator / rigid-body baseline
+            m = float(self.get_parameter("mass").value)
+            Ix = float(self.get_parameter("Ix").value)
+            Iy = float(self.get_parameter("Iy").value)
+            Iz = float(self.get_parameter("Iz").value)
 
-        # Quaternion derivative using body rates w
-        wx, wy, wz = w[0], w[1], w[2]
-        qdot = ca.vertcat(
-            0.5 * (-qx * wx - qy * wy - qz * wz),
-            0.5 * (qw * wx + qy * wz - qz * wy),
-            0.5 * (qw * wy - qx * wz + qz * wx),
-            0.5 * (qw * wz + qx * wy - qy * wx),
-        )
+            x = ca.SX.sym("x", 13)
+            p = x[0:3]
+            q = x[3:7]
+            v = x[7:10]
+            w = x[10:13]
 
-        # Translation dynamics
-        pdot = R @ v
-        vdot = (1.0 / m) * F
+            u = ca.SX.sym("u", 6)
+            F = u[0:3]
+            tau = u[3:6]
 
-        # Rotation dynamics
-        J = ca.diag(ca.vertcat(Ix, Iy, Iz))
-        Jinv = ca.diag(ca.vertcat(1.0/Ix, 1.0/Iy, 1.0/Iz))
+            qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+            R = ca.SX(3, 3)
+            R[0, 0] = 1 - 2 * (qy * qy + qz * qz)
+            R[0, 1] = 2 * (qx * qy - qz * qw)
+            R[0, 2] = 2 * (qx * qz + qy * qw)
+            R[1, 0] = 2 * (qx * qy + qz * qw)
+            R[1, 1] = 1 - 2 * (qx * qx + qz * qz)
+            R[1, 2] = 2 * (qy * qz - qx * qw)
+            R[2, 0] = 2 * (qx * qz - qy * qw)
+            R[2, 1] = 2 * (qy * qz + qx * qw)
+            R[2, 2] = 1 - 2 * (qx * qx + qy * qy)
 
-        Jw = J @ w  # 3x1
+            wx, wy, wz = w[0], w[1], w[2]
+            qdot = ca.vertcat(
+                0.5 * (-qx * wx - qy * wy - qz * wz),
+                0.5 * (qw * wx + qy * wz - qz * wy),
+                0.5 * (qw * wy - qx * wz + qz * wx),
+                0.5 * (qw * wz + qx * wy - qy * wx),
+            )
 
-        # cross(w, Jw)
-        w_cross_Jw = ca.vertcat(
-            w[1]*Jw[2] - w[2]*Jw[1],
-            w[2]*Jw[0] - w[0]*Jw[2],
-            w[0]*Jw[1] - w[1]*Jw[0],
-        )
+            pdot = R @ v
+            vdot = (1.0 / m) * F
 
-        wdot = Jinv @ (tau - w_cross_Jw)
+            J = ca.diag(ca.vertcat(Ix, Iy, Iz))
+            Jinv = ca.diag(ca.vertcat(1.0 / Ix, 1.0 / Iy, 1.0 / Iz))
+            Jw = J @ w
 
-        xdot = ca.vertcat(pdot, qdot, vdot, wdot)
-        xdot_fun = ca.Function("xdot", [x, u], [xdot])
+            w_cross_Jw = ca.vertcat(
+                w[1] * Jw[2] - w[2] * Jw[1],
+                w[2] * Jw[0] - w[0] * Jw[2],
+                w[0] * Jw[1] - w[1] * Jw[0],
+            )
 
-        def rk4(xk, uk):
-            k1 = xdot_fun(xk, uk)
-            k2 = xdot_fun(xk + 0.5 * Ts * k1, uk)
-            k3 = xdot_fun(xk + 0.5 * Ts * k2, uk)
-            k4 = xdot_fun(xk + Ts * k3, uk)
-            xkp1 = xk + (Ts / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+            wdot = Jinv @ (tau - w_cross_Jw)
 
-            qn = xkp1[3:7]
-            qn = qn / ca.sqrt(ca.dot(qn, qn) + 1e-12)
-            return ca.vertcat(xkp1[0:3], qn, xkp1[7:13])
+            xdot = ca.vertcat(pdot, qdot, vdot, wdot)
+            xdot_fun = ca.Function("xdot", [x, u], [xdot])
+
+            def rk4(xk, uk):
+                k1 = xdot_fun(xk, uk)
+                k2 = xdot_fun(xk + 0.5 * Ts * k1, uk)
+                k3 = xdot_fun(xk + 0.5 * Ts * k2, uk)
+                k4 = xdot_fun(xk + Ts * k3, uk)
+                xkp1 = xk + (Ts / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+                qn = xkp1[3:7]
+                qn = qn / ca.sqrt(ca.dot(qn, qn) + 1e-12)
+                return ca.vertcat(xkp1[0:3], qn, xkp1[7:13])
 
         # Parameters
         P = ca.SX.sym("P", 21)
@@ -337,6 +349,8 @@ class MPCHoldPosition(Node):
             dot_q = ca.dot(qk, qref)
             att_err_cost = 1.0 - dot_q * dot_q
             cost += hold_att_flag * w_att * att_err_cost
+
+            # Adding an input-rate penalty Delta u = u_k - u_{k-1} in the future would probably help a lot!
 
         pN = X[0:3, N]
         pos_err_N = pN - pref

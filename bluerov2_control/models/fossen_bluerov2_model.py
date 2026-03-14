@@ -11,8 +11,7 @@ State:
 Input:
     tau = [Fx, Fy, Fz, Mx, My, Mz] in body frame
 
-This is adapted from the user's numpy Fossen-style model into symbolic CasADi form
-so it can be dropped into the ROS2 MPC package and used inside the NLP.
+This is adapted from https://github.com/ViktorNfa/bluerov2_dynamics/blob/main/fossen/BlueROV2_wrench.py
 """
 
 import casadi as ca
@@ -83,8 +82,8 @@ def build_bluerov2_fossen_model(Ts, current_speed_ned=(0.0, 0.0, 0.0)):
     # ---------------- Physical parameters from source model ----------------
     rho = 1000.0
     g = 9.82
-    m = 13.5
-    volume = 0.0134
+    m = 13.0
+    volume = 0.0135
     W = m * g
     B = rho * g * volume
 
@@ -94,31 +93,31 @@ def build_bluerov2_fossen_model(Ts, current_speed_ned=(0.0, 0.0, 0.0)):
     zb = -0.01
 
     # Inertias
-    Ix = 0.26
-    Iy = 0.23
-    Iz = 0.37
+    Ix = 0.25
+    Iy = 0.221
+    Iz = 0.356
 
     # Added mass derivatives from source model
-    Xu_dot = -6.36
-    Yv_dot = -7.12
-    Zw_dot = -18.68
-    Kp_dot = -0.189
-    Mq_dot = -0.135
-    Nr_dot = -0.222
+    Xu_dot = -1.272
+    Yv_dot = -1.424
+    Zw_dot = -3.736
+    Kp_dot = -0.0378
+    Mq_dot = -0.027
+    Nr_dot = -0.044
 
     # Linear + quadratic damping coefficients from source model
     Xu = -13.7
-    Xu_abs = -141.0
-    Yv = -0.0
-    Yv_abs = -217.0
-    Zw = -33.0
-    Zw_abs = -190.0
-    Kp = -0.0
-    Kp_abs = -1.19
+    Xu_abs = -14.1
+    Yv = -1.0
+    Yv_abs = -21.7
+    Zw = -23.0
+    Zw_abs = -19.0
+    Kp = -0.5
+    Kp_abs = -0.119
     Mq = -0.8
-    Mq_abs = -0.47
-    Nr = -0.0
-    Nr_abs = -1.5
+    Mq_abs = -0.047
+    Nr = -0.1
+    Nr_abs = -0.15
 
     # ---------------- State / input symbols ----------------
     x = ca.SX.sym("x", 13)

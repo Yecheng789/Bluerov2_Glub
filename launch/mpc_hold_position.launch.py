@@ -43,7 +43,11 @@ def generate_launch_description():
                 "N": 25,
                 "solve_rate_hz": 25.0,
 
-                # Model
+                # Model selector
+                # options: "double_integrator", "fossen" or "koopman"
+                "model_type": "fossen",
+
+                # Model (only for double_integrator)
                 "mass": 13.0,
                 "Ix": 0.25,
                 "Iy": 0.221,
