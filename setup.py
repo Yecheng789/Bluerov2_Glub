@@ -19,6 +19,7 @@ setup(
         ('share/' + package_name + '/launch', ['launch/position_control_pid.launch.py']),
         ('share/' + package_name + '/launch', ['launch/stabilized_control.launch.py']),
         ('share/' + package_name + '/launch', ['launch/mpc_hold_position.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/mpc_hold_position_acados.launch.py']),
         # --- install weights into share/<pkg>/models/weights ---
         ('share/' + package_name + '/models/weights',
             glob('bluerov2_control/models/weights/*.npz')),
@@ -37,6 +38,7 @@ setup(
             'position_control_pid = bluerov2_control.position_control_pid:main',
             'stabilized_control = bluerov2_control.stabilized_control:main',
             'mpc_hold_position = bluerov2_control.mpc_hold_position:main',
+            'mpc_hold_position_acados = bluerov2_control.mpc_hold_position_acados:main',
             'wasd_teleop = bluerov2_control.wasd_teleop:main',
         ],
     },
