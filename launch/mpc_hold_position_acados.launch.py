@@ -78,7 +78,7 @@ def generate_launch_description():
 
                 # acados solver build/cache settings
                 "codegen_dir": "/tmp/bluerov2_acados_codegen",
-                "rebuild_solver": False,
+                "rebuild_solver": True,
             }],
         ),
     ])

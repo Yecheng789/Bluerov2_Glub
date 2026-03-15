@@ -64,7 +64,6 @@ source install/setup.bash
 ros2 launch bluerov2_control mpc_hold_position.launch.py
 ```
 
-# STILL IN PROGRESS
 ## For 6DoF MPC Holding controller (acados):
 
 Acados is a fast nonlinear optimization library designed for embedded applications. To use it first install it following the official documentation:

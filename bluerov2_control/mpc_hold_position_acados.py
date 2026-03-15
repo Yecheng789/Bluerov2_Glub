@@ -283,24 +283,42 @@ class MPCHoldPositionAcados(Node):
         w_u_torque = float(self.get_parameter("w_u_torque").value)
 
         pos_err = pos - pref
-        dot_q = ca.dot(q, qref)
-        att_err_cost = 1.0 - dot_q * dot_q
 
-        stage_cost = (
-            w_pos * ca.dot(pos_err, pos_err)
-            + w_vel * ca.dot(vel, vel)
-            + w_omega * ca.dot(omega, omega)
-            + w_u_force * ca.dot(F, F)
-            + w_u_torque * ca.dot(tau, tau)
-            + hold_att_flag * w_att * att_err_cost
-        )
-        terminal_cost = (
-            2.0 * w_pos * ca.dot(pos_err, pos_err)
-            + hold_att_flag * 2.0 * w_att * att_err_cost
+        # Quaternion error
+        q1 = qref
+        q2 = q
+        q_conj = ca.vertcat(q2[0], -q2[1], -q2[2], -q2[3])
+        q2_inv = q_conj / ca.norm_2(q2)
+
+        q_w = q1[0] * q2_inv[0] - q1[1] * q2_inv[1] - q1[2] * q2_inv[2] - q1[3] * q2_inv[3]
+        q_x = q1[0] * q2_inv[1] + q1[1] * q2_inv[0] + q1[2] * q2_inv[3] - q1[3] * q2_inv[2]
+        q_y = q1[0] * q2_inv[2] - q1[1] * q2_inv[3] + q1[2] * q2_inv[0] + q1[3] * q2_inv[1]
+        q_z = q1[0] * q2_inv[3] + q1[1] * q2_inv[2] - q1[2] * q2_inv[1] + q1[3] * q2_inv[0]
+
+        q_err = ca.vertcat(q_w, q_x, q_y, q_z)
+        q_err = ca.if_else(q_w < 0, -q_err, q_err)
+
+        # zero residual at perfect attitude match
+        att_res = hold_att_flag * q_err[1:4]
+
+        y_stage = ca.vertcat(
+            pos_err,
+            att_res,
+            vel,
+            omega,
+            F,
+            tau,
         )
 
-        model.cost_expr_ext_cost = stage_cost
-        model.cost_expr_ext_cost_e = terminal_cost
+        y_term = ca.vertcat(
+            pos_err,
+            att_res,
+            vel,
+            omega,
+        )
+
+        model.cost_y_expr = y_stage
+        model.cost_y_expr_e = y_term
 
         ocp = AcadosOcp()
         ocp.model = model
@@ -309,8 +327,29 @@ class MPCHoldPositionAcados(Node):
 
         ocp.parameter_values = np.zeros(8)
 
-        ocp.cost.cost_type = "EXTERNAL"
-        ocp.cost.cost_type_e = "EXTERNAL"
+        ocp.cost.cost_type = "NONLINEAR_LS"
+        ocp.cost.cost_type_e = "NONLINEAR_LS"
+
+        W = np.diag(np.concatenate([
+            w_pos * np.ones(3),          # pos
+            w_att * np.ones(3),          # quat vector error
+            w_vel * np.ones(3),          # linear vel
+            w_omega * np.ones(3),        # angular vel
+            w_u_force * np.ones(3),      # force input
+            w_u_torque * np.ones(3),     # torque input
+        ]))
+
+        W_e = np.diag(np.concatenate([
+            2.0 * w_pos * np.ones(3),    # terminal pos
+            2.0 * w_att * np.ones(3),    # terminal quat vector error
+            w_vel * np.ones(3),          # terminal vel
+            w_omega * np.ones(3),        # terminal omega
+        ]))
+
+        ocp.cost.W = W
+        ocp.cost.W_e = W_e
+        ocp.cost.yref = np.zeros((18,))
+        ocp.cost.yref_e = np.zeros((12,))
 
         Fx_max_N = float(self.get_parameter("Fx_max_N").value)
         Fy_max_N = float(self.get_parameter("Fy_max_N").value)
@@ -330,7 +369,7 @@ class MPCHoldPositionAcados(Node):
         ocp.constraints.x0 = x0
 
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
-        ocp.solver_options.hessian_approx = "EXACT"
+        ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
         ocp.solver_options.integrator_type = "ERK"
         ocp.solver_options.nlp_solver_type = "SQP_RTI"
         ocp.solver_options.print_level = 0
