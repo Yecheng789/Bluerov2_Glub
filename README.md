@@ -32,7 +32,7 @@ Also, make sure to arm the vehicle adter you run the controller node.
 
 ## For PID Position Control:
 
-Same setup as stabilized Control but run:
+Same setup as Stabilized Control but run:
 ```bash
 cd ~/px4_ws
 colcon build
@@ -86,7 +86,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/acados/lib
 export ACADOS_SOURCE_DIR=$HOME/acados
 ```
 
-To make them permanent, you can add those two lines to ```~/.bashrc```. You will also probably have to install the ```t_renderer```, for that download the latest one for your system [here](https://github.com/acados/tera_renderer/releases/), rename it to just ```t_renderer``` and then inside your acados repository folder do:
+To make them permanent, you can add those two lines to ```~/.bashrc```. You will also probably have to install the ```t_renderer```, for that, download the latest one for your system [here](https://github.com/acados/tera_renderer/releases/), rename it to just ```t_renderer``` and then inside your acados repository folder do:
 ```bash
 mkdir -p bin
 ```
