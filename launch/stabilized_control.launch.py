@@ -2,8 +2,6 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    ns = "/itrl_rov_1"
-
     return LaunchDescription([
         Node(
             package="bluerov2_control",
@@ -11,7 +9,7 @@ def generate_launch_description():
             name="offboard_heartbeat_wrench",
             output="screen",
             parameters=[{
-                "topic": f"{ns}/fmu/in/offboard_control_mode",
+                "topic": "/fmu/in/offboard_control_mode",
             }],
         ),
 
@@ -21,31 +19,27 @@ def generate_launch_description():
             name="stabilized_control",
             output="screen",
             parameters=[{
-                "odom_topic": f"{ns}/fmu/out/vehicle_odometry",
-                # "odom_topic": "/mocap/itrl_rov_1/odom", # real mocap odom
-                "control_mode_topic": f"{ns}/fmu/out/vehicle_control_mode",
-                "thrust_sp_topic": f"{ns}/fmu/in/vehicle_thrust_setpoint",
-                "torque_sp_topic": f"{ns}/fmu/in/vehicle_torque_setpoint",
-                "cmd_vel_topic": f"{ns}/cmd_vel",
+                "odom_topic": "/fmu/out/vehicle_odometry",
+                "control_mode_topic": "/fmu/out/vehicle_control_mode",
+                "thrust_sp_topic": "/fmu/in/vehicle_thrust_setpoint",
+                "torque_sp_topic": "/fmu/in/vehicle_torque_setpoint",
+                "cmd_vel_topic": "/itrl_rov_1/cmd_vel",
 
-                # PX4 defaults
                 "UUV_ROLL_P": 4.0,
                 "UUV_ROLL_D": 1.5,
                 "UUV_PITCH_P": 4.0,
                 "UUV_PITCH_D": 2.0,
-                "UUV_YAW_P": 2.0,
-                "UUV_YAW_D": 0.5,
+                "UUV_YAW_P": 4.0,
+                "UUV_YAW_D": 2.0,
 
                 "UUV_SGM_YAW": 0.7,
                 "UUV_SGM_THRTL": 0.15,
-                "UUV_TORQUE_SAT": 0.4,
-                "UUV_THRUST_SAT": 0.15,
+                "UUV_TORQUE_SAT": 1.2,
+                "UUV_THRUST_SAT": 0.25,
 
-                # 0 = XYZ thrust (heave/sway enabled), 1 = surge-only
                 "UUV_STICK_MODE": 0,
 
-                # Convention knobs
-                "yaw_sign": -1.0,
+                "yaw_sign": 1.0,
                 "z_sign": -1.0,
                 "yaw_rate_lpf_hz": 8.0,
 

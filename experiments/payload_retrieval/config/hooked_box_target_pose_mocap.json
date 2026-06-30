@@ -1,0 +1,73 @@
+{
+  "description": "Recorded BlueROV pose when the passive hook is engaged with the payload box handle.",
+  "frame_id": "mocap",
+  "source_topic": "/mocap/glub/pose",
+  "message_type": "geometry_msgs/PoseStamped",
+  "recorded_date": "2026-06-21",
+  "target_pose": {
+    "position": {
+      "x": 5.434088541666667,
+      "y": -0.05951349258422851,
+      "z": 0.8079994506835938
+    },
+    "orientation_xyzw": {
+      "x": 0.08178939681072539,
+      "y": -0.620922921618935,
+      "z": 0.7714736572781943,
+      "w": -0.1122212686885678
+    }
+  },
+  "sample_standard_deviation": {
+    "position_m": {
+      "x": 0.0007016667507608802,
+      "y": 0.0003307006657509522,
+      "z": 0.0017016645145557734
+    }
+  },
+  "raw_samples": [
+    {
+      "position": {
+        "x": 5.43505224609375,
+        "y": -0.05911128616333008,
+        "z": 0.8103634643554688
+      },
+      "orientation_xyzw": {
+        "x": 0.08312680685502315,
+        "y": -0.6235806176147695,
+        "z": 0.7692626639319563,
+        "w": -0.11167849041335151
+      }
+    },
+    {
+      "position": {
+        "x": 5.43340185546875,
+        "y": -0.05992127227783203,
+        "z": 0.8072073974609375
+      },
+      "orientation_xyzw": {
+        "x": 0.08068178565474607,
+        "y": -0.620776587832529,
+        "z": 0.7716178754392328,
+        "w": -0.11283940548817335
+      }
+    },
+    {
+      "position": {
+        "x": 5.4338115234375,
+        "y": -0.05950791931152344,
+        "z": 0.806427490234375
+      },
+      "orientation_xyzw": {
+        "x": 0.08155853768807284,
+        "y": -0.618403386375114,
+        "z": 0.7735302705710411,
+        "w": -0.11214443060979397
+      }
+    }
+  ],
+  "notes": [
+    "The target pose is the normalized mean of the three visible samples.",
+    "Use this as the terminal hook pose for the first fixed-target experiment.",
+    "Do not feed this directly to controllers expecting px4_msgs/VehicleOdometry without a compatible state adapter."
+  ]
+}

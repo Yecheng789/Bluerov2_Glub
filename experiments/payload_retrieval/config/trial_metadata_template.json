@@ -1,0 +1,43 @@
+{
+  "controller": {
+    "name": "stabilized_control",
+    "parameter_file": "",
+    "git_commit": "",
+    "notes": ""
+  },
+  "environment": {
+    "type": "gazebo_or_pool",
+    "world_or_pool": "kth_tank",
+    "water_condition": "",
+    "lighting_condition": ""
+  },
+  "robot": {
+    "name": "BlueROV2 Heavy",
+    "namespace": "/itrl_rov_1",
+    "battery_voltage_start": null,
+    "battery_voltage_end": null
+  },
+  "payload": {
+    "design_version": "",
+    "mass_kg": null,
+    "handle_pose_source": "perception_or_mocap_or_manual",
+    "initial_pose_xyz": null
+  },
+  "retrieval_tool": {
+    "design_version": "",
+    "hook_geometry_notes": "",
+    "mount_pose_notes": ""
+  },
+  "perception": {
+    "model_name": "YOLO_handle_detector",
+    "weights_version": "",
+    "camera_calibration_version": "",
+    "confidence_threshold": 0.5
+  },
+  "trial": {
+    "operator": "",
+    "objective": "detect_approach_hook_return_dock",
+    "planned_repetitions": null,
+    "notes": ""
+  }
+}

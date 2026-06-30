@@ -1,0 +1,138 @@
+{
+  "all_trial_hooked_baselines": [
+    {
+      "distance_to_photo_position_m": 0.42740908107312897,
+      "event": "hooked",
+      "event_elapsed_s": 138.981104136,
+      "event_note": "reached trial baseline hook pose",
+      "orientation_error_to_photo_deg": 150.75614257097803,
+      "orientation_xyzw": {
+        "w": 0.1479448864999563,
+        "x": -0.006176829259994166,
+        "y": -0.023399750844517845,
+        "z": 0.9886994533220004
+      },
+      "position": {
+        "x": 4.210804217987925,
+        "y": -0.06233541333069343,
+        "z": 0.6932255498093461
+      },
+      "sample_count": 12,
+      "sample_standard_deviation": {
+        "position_m": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        }
+      },
+      "trial_id": "retrieval_20260623_104140"
+    },
+    {
+      "distance_to_photo_position_m": 0.32266500241711565,
+      "event": "hooked",
+      "event_elapsed_s": 88.572376251,
+      "event_note": "reached trial baseline hook pose",
+      "orientation_error_to_photo_deg": 169.73229641853294,
+      "orientation_xyzw": {
+        "w": 0.9610624618201986,
+        "x": -0.14268040808313184,
+        "y": -0.10891560231139981,
+        "z": -0.21009197319858605
+      },
+      "position": {
+        "x": 4.397021484375,
+        "y": -0.17737956237792965,
+        "z": 0.678709228515625
+      },
+      "sample_count": 12,
+      "sample_standard_deviation": {
+        "position_m": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        }
+      },
+      "trial_id": "retrieval_20260623_104703"
+    },
+    {
+      "distance_to_photo_position_m": 0.21320774452666133,
+      "event": "hooked",
+      "event_elapsed_s": 50.49287653,
+      "event_note": "reached trial baseline hook pose",
+      "orientation_error_to_photo_deg": 156.10021892584564,
+      "orientation_xyzw": {
+        "w": 0.04164732496709925,
+        "x": -0.0455690271988102,
+        "y": -0.016922554447342586,
+        "z": 0.9979491927118412
+      },
+      "position": {
+        "x": 4.79125634765625,
+        "y": -0.046869861602783204,
+        "z": 0.521372314453125
+      },
+      "sample_count": 12,
+      "sample_standard_deviation": {
+        "position_m": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        }
+      },
+      "trial_id": "retrieval_20260623_104941"
+    }
+  ],
+  "baseline_policy": "Use the latest valid June 23 hooked event marked 'reached trial baseline hook pose'. The photo is auxiliary only.",
+  "description": "Current fixed hook target pose derived from the latest recorded trial data, with the new photo used only as a consistency aid.",
+  "frame_id": "mocap",
+  "message_type": "nav_msgs/Odometry",
+  "notes": [
+    "The numeric baseline comes from /mocap/glub/odom_ekf in retrieval_20260623_104941.",
+    "The new photo is not used as the numeric target because it differs from the logged odom_ekf pose by about 0.213 m and has a different orientation.",
+    "Do not average baselines from different box placements.",
+    "Use this file only for the same physical box/setup placement as the source trial."
+  ],
+  "photo_auxiliary_pose": {
+    "message_type": "geometry_msgs/PoseStamped",
+    "orientation_xyzw": {
+      "w": 0.13137251691097226,
+      "x": 0.907360268257391,
+      "y": 0.31236635314853983,
+      "z": 0.2487284895206413
+    },
+    "position": {
+      "x": 4.609111328125,
+      "y": 0.04579510879516602,
+      "z": 0.5821500854492188
+    },
+    "source": "user-provided terminal photo on 2026-06-24"
+  },
+  "sample_count": 12,
+  "sample_standard_deviation": {
+    "position_m": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    }
+  },
+  "source_event": {
+    "elapsed_s": 50.49287653,
+    "name": "hooked",
+    "note": "reached trial baseline hook pose"
+  },
+  "source_topic": "/mocap/glub/odom_ekf",
+  "source_trial_id": "retrieval_20260623_104941",
+  "target_pose": {
+    "orientation_xyzw": {
+      "w": 0.04164732496709925,
+      "x": -0.0455690271988102,
+      "y": -0.016922554447342586,
+      "z": 0.9979491927118412
+    },
+    "position": {
+      "x": 4.79125634765625,
+      "y": -0.046869861602783204,
+      "z": 0.521372314453125
+    }
+  }
+}
