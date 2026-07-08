@@ -1,0 +1,32 @@
+{
+  "description": "Averaged fixed hook target pose recorded from MoCap.",
+  "frame_id": "mocap",
+  "message_type": "nav_msgs/Odometry",
+  "notes": [
+    "Record this while the robot is physically held at the hook-engaged pose.",
+    "Use the same topic that the validation logger records."
+  ],
+  "recorded_wall_utc": "2026-07-06T09:04:01.615+00:00",
+  "sample_count": 80,
+  "sample_standard_deviation": {
+    "position_m": {
+      "x": 0.0007245254271286937,
+      "y": 0.0007812631123461858,
+      "z": 0.00010614988822968165
+    }
+  },
+  "source_topic": "/mocap/glub/odom_ekf",
+  "target_pose": {
+    "orientation_xyzw": {
+      "w": 0.9769826499523426,
+      "x": 0.08278497111584006,
+      "y": 0.06761436449232686,
+      "z": -0.1846072803649598
+    },
+    "position": {
+      "x": 3.35291539949664,
+      "y": 0.2204697286252401,
+      "z": 1.4781581323325614
+    }
+  }
+}
