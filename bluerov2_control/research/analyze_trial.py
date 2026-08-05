@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 
 Vector3 = Tuple[float, float, float]
+QuaternionWXYZ = Tuple[float, float, float, float]
 
 
 SUCCESS_EVENTS = {"success", "mission_success", "recovered", "delivered", "complete", "completed"}
@@ -29,7 +30,7 @@ STAGE_EVENTS = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute thesis-ready metrics from payload retrieval CSV logs."
     )
@@ -38,12 +39,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payload-target", default="", help="Static payload target x,y,z if not logged.")
     parser.add_argument("--dock-target", default="", help="Static dock target x,y,z if not logged.")
     parser.add_argument("--tank-bounds", default="", help="xmin,xmax,ymin,ymax,zmin,zmax for safety analysis.")
+    parser.add_argument(
+        "--target-quaternion-wxyz",
+        type=parse_quaternion_wxyz,
+        default=None,
+        help=(
+            "Static target attitude qw,qx,qy,qz in the selected pose source "
+            "frame. Enables full-attitude error metrics."
+        ),
+    )
+    parser.add_argument(
+        "--hold-window-s",
+        type=positive_finite_float,
+        default=5.0,
+        help="Final time window used for target-attitude RMS/max error (default: 5 s).",
+    )
     parser.add_argument("--stale-max-s", type=float, default=0.5, help="Max age for perception/pose data.")
     parser.add_argument("--confidence-threshold", type=float, default=0.5)
     parser.add_argument("--gap-max-s", type=float, default=1.0, help="Ignore path/effort gaps above this.")
     parser.add_argument("--output-dir", default="", help="Analysis output directory.")
     parser.add_argument("--no-plots", action="store_true", help="Skip matplotlib figures.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def as_float(row: Dict[str, str], key: str) -> Optional[float]:
@@ -76,6 +92,48 @@ def parse_vector(text: str) -> Optional[Vector3]:
     if len(parts) != 3:
         raise ValueError(f"expected x,y,z, got: {text!r}")
     return (float(parts[0]), float(parts[1]), float(parts[2]))
+
+
+def normalize_quaternion_wxyz(values: Sequence[float]) -> QuaternionWXYZ:
+    """Return a finite unit quaternion, rejecting missing/zero input."""
+    if len(values) != 4:
+        raise ValueError("expected exactly four quaternion values (qw,qx,qy,qz)")
+    try:
+        quaternion = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("quaternion values must be numeric") from exc
+    if not all(math.isfinite(value) for value in quaternion):
+        raise ValueError("quaternion values must all be finite")
+    scale = max(abs(value) for value in quaternion)
+    if scale == 0.0:
+        raise ValueError("quaternion norm must be non-zero")
+    scaled = tuple(value / scale for value in quaternion)
+    norm = math.sqrt(sum(value * value for value in scaled))
+    return tuple(value / norm for value in scaled)  # type: ignore[return-value]
+
+
+def parse_quaternion_wxyz(text: str) -> QuaternionWXYZ:
+    """Argparse converter for a strict comma-separated WXYZ quaternion."""
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 4 or any(not part for part in parts):
+        raise argparse.ArgumentTypeError(
+            f"expected qw,qx,qy,qz, got: {text!r}"
+        )
+    try:
+        return normalize_quaternion_wxyz(parts)  # type: ignore[arg-type]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def positive_finite_float(text: str) -> float:
+    """Argparse converter for a finite, strictly positive duration."""
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return value
 
 
 def parse_bounds(text: str) -> Optional[Tuple[float, float, float, float, float, float]]:
@@ -179,6 +237,101 @@ def pose_series(
         if t is not None and pose is not None and pose_valid(row, prefix, stale_max_s):
             series.append((t, pose))
     return series
+
+
+def quaternion_from_row(
+    row: Dict[str, str],
+    prefix: str,
+) -> Optional[QuaternionWXYZ]:
+    values = values_for_keys(
+        row,
+        (
+            f"{prefix}_qw",
+            f"{prefix}_qx",
+            f"{prefix}_qy",
+            f"{prefix}_qz",
+        ),
+    )
+    if values is None:
+        return None
+    try:
+        return normalize_quaternion_wxyz(values)
+    except ValueError:
+        return None
+
+
+def quaternion_angle_error_deg(
+    quaternion: Sequence[float],
+    target: Sequence[float],
+) -> float:
+    """Shortest full 3-D attitude error, treating q and -q as equivalent."""
+    q = normalize_quaternion_wxyz(quaternion)
+    q_target = normalize_quaternion_wxyz(target)
+    dot = abs(sum(a * b for a, b in zip(q, q_target)))
+    return math.degrees(2.0 * math.acos(max(-1.0, min(1.0, dot))))
+
+
+def orientation_error_series(
+    rows: Sequence[Dict[str, str]],
+    prefix: str,
+    t0: float,
+    target: QuaternionWXYZ,
+) -> List[Tuple[float, float]]:
+    """Extract valid selected-source quaternions and compare them to target."""
+    series = []
+    for row in rows:
+        t = relative_time(row, t0)
+        quaternion = quaternion_from_row(row, prefix)
+        if (
+            t is not None
+            and quaternion is not None
+            and pose_valid(row, prefix)
+        ):
+            series.append((t, quaternion_angle_error_deg(quaternion, target)))
+    return series
+
+
+def summarize_orientation_error(
+    series: Sequence[Tuple[float, float]],
+    hold_window_s: float,
+) -> Dict[str, Optional[float]]:
+    """Summarize whole-trial and final-window target-attitude error."""
+    keys = {
+        "orientation_error_initial_deg": None,
+        "orientation_error_min_deg": None,
+        "orientation_error_final_deg": None,
+        "orientation_error_time_of_min_s": None,
+        "orientation_error_hold_window_s": hold_window_s,
+        "orientation_error_hold_rms_deg": None,
+        "orientation_error_hold_max_deg": None,
+        "orientation_error_hold_samples": 0.0,
+        "orientation_error_hold_coverage_s": None,
+    }
+    if not series:
+        return keys
+
+    min_t, min_error = min(series, key=lambda item: item[1])
+    final_t = series[-1][0]
+    hold_start = final_t - hold_window_s
+    hold_series = [item for item in series if item[0] >= hold_start]
+    hold_values = [value for _time, value in hold_series]
+    keys.update(
+        {
+            "orientation_error_initial_deg": series[0][1],
+            "orientation_error_min_deg": min_error,
+            "orientation_error_final_deg": series[-1][1],
+            "orientation_error_time_of_min_s": min_t,
+            "orientation_error_hold_rms_deg": math.sqrt(
+                statistics.fmean(value * value for value in hold_values)
+            ),
+            "orientation_error_hold_max_deg": max(hold_values),
+            "orientation_error_hold_samples": float(len(hold_values)),
+            "orientation_error_hold_coverage_s": (
+                hold_series[-1][0] - hold_series[0][0]
+            ),
+        }
+    )
+    return keys
 
 
 def path_length(series: Sequence[Tuple[float, Vector3]], gap_max_s: float) -> float:
@@ -520,6 +673,16 @@ def compute_metrics(
         if dock_target is not None
         else distances_to_dynamic_target(rows, pose_prefix, "dock", t0, args.stale_max_s)
     )
+    target_quaternion = getattr(args, "target_quaternion_wxyz", None)
+    attitude_error: List[Tuple[float, float]] = []
+    if target_quaternion is not None:
+        normalized_target = normalize_quaternion_wxyz(target_quaternion)
+        attitude_error = orientation_error_series(
+            rows,
+            pose_prefix,
+            t0,
+            normalized_target,
+        )
 
     conf_values = confidence_values(rows, args.stale_max_s)
     first_det = first_detection_time(rows, t0, args.stale_max_s, args.confidence_threshold)
@@ -562,6 +725,13 @@ def compute_metrics(
     metrics.update(summarize_distance(payload_distance, "distance_to_payload"))
     metrics.update(summarize_distance(handle_distance, "distance_to_handle"))
     metrics.update(summarize_distance(dock_distance, "distance_to_dock"))
+    if target_quaternion is not None:
+        metrics.update(
+            summarize_orientation_error(
+                attitude_error,
+                getattr(args, "hold_window_s", 5.0),
+            )
+        )
 
     bounds = parse_bounds(args.tank_bounds)
     if bounds is not None:
@@ -574,6 +744,7 @@ def compute_metrics(
         "payload_distance": payload_distance,
         "handle_distance": handle_distance,
         "dock_distance": dock_distance,
+        "orientation_error_deg": attitude_error,
     }
     return metrics, series, pose_prefix
 
@@ -639,6 +810,16 @@ def write_markdown(path: Path, metrics: Dict[str, Any], events: Sequence[Dict[st
         f"| Final distance to dock (m) | {fmt(metrics.get('distance_to_dock_final_m'))} |",
         f"| Thrust L1 integral (norm*s) | {fmt(metrics.get('thrust_l1_integral_s'))} |",
         f"| Torque L1 integral (norm*s) | {fmt(metrics.get('torque_l1_integral_s'))} |",
+    ]
+    if "orientation_error_initial_deg" in metrics:
+        lines += [
+            f"| Initial attitude error (deg) | {fmt(metrics.get('orientation_error_initial_deg'))} |",
+            f"| Min attitude error (deg) | {fmt(metrics.get('orientation_error_min_deg'))} |",
+            f"| Final attitude error (deg) | {fmt(metrics.get('orientation_error_final_deg'))} |",
+            f"| Hold-window attitude RMS (deg) | {fmt(metrics.get('orientation_error_hold_rms_deg'))} |",
+            f"| Hold-window attitude max (deg) | {fmt(metrics.get('orientation_error_hold_max_deg'))} |",
+        ]
+    lines += [
         "",
         "## Stage Times",
         "",
@@ -735,6 +916,22 @@ def maybe_make_plots(
         plt.savefig(out_dir / "motion_and_control.png", dpi=160)
     plt.close()
 
+    attitude_error = series.get("orientation_error_deg", [])
+    if attitude_error:
+        plt.figure()
+        plt.plot(
+            [item[0] for item in attitude_error],
+            [item[1] for item in attitude_error],
+            label="full attitude error",
+        )
+        plt.xlabel("time [s]")
+        plt.ylabel("shortest attitude error [deg]")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "orientation_error.png", dpi=160)
+        plt.close()
+
 
 def main() -> None:
     args = parse_args()
@@ -773,6 +970,16 @@ def main() -> None:
     print(f"Duration: {fmt(metrics.get('duration_s'))} s")
     print(f"Success: {fmt(metrics.get('success'))}")
     print(f"Min handle distance: {fmt(metrics.get('distance_to_handle_min_m'))} m")
+    if "orientation_error_final_deg" in metrics:
+        print(
+            "Final attitude error: "
+            f"{fmt(metrics.get('orientation_error_final_deg'))} deg"
+        )
+        print(
+            "Hold-window attitude RMS/max: "
+            f"{fmt(metrics.get('orientation_error_hold_rms_deg'))}/"
+            f"{fmt(metrics.get('orientation_error_hold_max_deg'))} deg"
+        )
 
 
 if __name__ == "__main__":

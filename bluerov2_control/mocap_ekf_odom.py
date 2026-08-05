@@ -447,7 +447,7 @@ class MocapEkfOdom(Node):
     def __init__(self):
         super().__init__("mocap_ekf_odom")
 
-        self.declare_parameter("rigid_body_name", "glub")
+        self.declare_parameter("rigid_body_name", "glub_fb")
         rigid_body_name = str(self.get_parameter("rigid_body_name").value)
 
         self.declare_parameter("pose_topic", "")
@@ -464,6 +464,11 @@ class MocapEkfOdom(Node):
         self.declare_parameter("orientation_correction_quat_xyzw", "")
         self.declare_parameter("max_coast_sec", 1.0)
         self.declare_parameter("max_rejected_samples", 200)
+        self.declare_parameter("max_pose_message_age_sec", 0.5)
+        self.declare_parameter("max_pose_future_skew_sec", 0.1)
+        self.declare_parameter("require_increasing_pose_stamp", True)
+        self.declare_parameter("expected_pose_frame", "")
+        self.declare_parameter("reject_unexpected_pose_frame", False)
 
         self.declare_parameter("position_std", 0.01)
         self.declare_parameter("orientation_std", 0.12)
@@ -516,6 +521,21 @@ class MocapEkfOdom(Node):
         self._max_rejected_samples = int(
             self.get_parameter("max_rejected_samples").value
         )
+        self._max_pose_message_age_sec = float(
+            self.get_parameter("max_pose_message_age_sec").value
+        )
+        self._max_pose_future_skew_sec = float(
+            self.get_parameter("max_pose_future_skew_sec").value
+        )
+        self._require_increasing_pose_stamp = bool(
+            self.get_parameter("require_increasing_pose_stamp").value
+        )
+        self._expected_pose_frame = str(
+            self.get_parameter("expected_pose_frame").value
+        ).strip()
+        self._reject_unexpected_pose_frame = bool(
+            self.get_parameter("reject_unexpected_pose_frame").value
+        )
 
         self._filter = QuaternionCvEkf(
             position_std=float(self.get_parameter("position_std").value),
@@ -542,19 +562,32 @@ class MocapEkfOdom(Node):
         )
         self._last_filter_sec = None
         self._last_pose_rx_sec = None
+        self._last_pose_accepted_sec = None
+        self._last_pose_header_stamp_ns = None
         self._consecutive_full_rejections = 0
         self._imu_gyro_lpf = None
 
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-        self._odom_pub = self.create_publisher(Odometry, self._odom_topic, qos)
+        input_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+        output_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self._odom_pub = self.create_publisher(
+            Odometry, self._odom_topic, output_qos
+        )
         self.create_subscription(
             PoseStamped,
             self._pose_topic,
             self._pose_cb,
-            qos,
+            input_qos,
         )
         if self._use_imu_gyro:
-            self.create_subscription(Imu, self._imu_topic, self._imu_cb, qos)
+            self.create_subscription(
+                Imu, self._imu_topic, self._imu_cb, input_qos
+            )
 
         if self._publish_tf:
             self._tf_broadcaster = TransformBroadcaster(self)
@@ -580,6 +613,7 @@ class MocapEkfOdom(Node):
             f"rate={self._publish_rate_hz:.1f}Hz, "
             f"publish_tf={self._publish_tf}, "
             f"max_coast={self._max_coast_sec:.2f}s, "
+            f"max_pose_age={self._max_pose_message_age_sec:.2f}s, "
             "orientation_correction_xyzw="
             f"[{self._orientation_correction[0]:.6f}, "
             f"{self._orientation_correction[1]:.6f}, "
@@ -596,7 +630,6 @@ class MocapEkfOdom(Node):
 
     def _pose_cb(self, msg):
         now = self._now_sec()
-        self._predict_to(now)
 
         position = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
@@ -611,19 +644,94 @@ class MocapEkfOdom(Node):
             ],
             dtype=float,
         )
-        orientation = quat_multiply(orientation, self._orientation_correction)
+        frame_id = str(msg.header.frame_id)
+        if (
+            self._reject_unexpected_pose_frame
+            and frame_id != self._expected_pose_frame
+        ):
+            self._reject_pose_transport(
+                f"pose frame {frame_id!r} does not match expected "
+                f"{self._expected_pose_frame!r}",
+                now,
+            )
+            return
+        stamp_ns = (
+            int(msg.header.stamp.sec) * 1_000_000_000
+            + int(msg.header.stamp.nanosec)
+        )
+        now_ns = self.get_clock().now().nanoseconds
+        if self._require_increasing_pose_stamp:
+            if stamp_ns <= 0:
+                self._reject_pose_transport(
+                    "missing or zero pose header timestamp", now
+                )
+                return
+            if (
+                self._last_pose_header_stamp_ns is not None
+                and stamp_ns <= self._last_pose_header_stamp_ns
+            ):
+                self._reject_pose_transport(
+                    "duplicate or non-increasing pose header timestamp", now
+                )
+                return
+        if stamp_ns > 0:
+            message_age_sec = (now_ns - stamp_ns) * 1e-9
+            if (
+                self._max_pose_message_age_sec > 0.0
+                and message_age_sec > self._max_pose_message_age_sec
+            ):
+                self._reject_pose_transport(
+                    f"pose timestamp is stale by {message_age_sec:.3f}s",
+                    now,
+                )
+                return
+            if message_age_sec < -self._max_pose_future_skew_sec:
+                self._reject_pose_transport(
+                    f"pose timestamp is {-message_age_sec:.3f}s in the future",
+                    now,
+                )
+                return
+            self._last_pose_header_stamp_ns = stamp_ns
 
-        accepted = self._filter.update_pose(position, orientation)
+        self._predict_to(now)
+        quaternion_norm = float(np.linalg.norm(orientation))
+        if (
+            not all_finite(position, orientation)
+            or not math.isfinite(quaternion_norm)
+            or quaternion_norm <= 1e-12
+        ):
+            self._filter.last_pose_rejection_reason = (
+                "non-finite position or invalid zero-length quaternion"
+            )
+            accepted = False
+        else:
+            orientation = quat_multiply(
+                orientation,
+                self._orientation_correction,
+            )
+            accepted = self._filter.update_pose(position, orientation)
         self._handle_update_result(accepted, position, orientation)
         self._last_pose_rx_sec = now
+        if accepted:
+            self._last_pose_accepted_sec = now
 
-        frame_id = msg.header.frame_id
         if frame_id and frame_id != self._parent_frame:
             self.get_logger().warn(
                 "Received pose in frame "
                 f"'{frame_id}', publishing odom in '{self._parent_frame}'.",
                 throttle_duration_sec=2.0,
             )
+
+    def _reject_pose_transport(self, reason, now):
+        """Reject stale/replayed transport data without reinitializing EKF."""
+        self._last_pose_rx_sec = now
+        self._consecutive_full_rejections += 1
+        self.get_logger().warn(
+            "Rejected MoCap pose transport sample: "
+            f"{reason}; consecutive_rejections="
+            f"{self._consecutive_full_rejections}",
+            throttle_duration_sec=1.0,
+        )
 
     def _imu_cb(self, msg):
         if not self._use_imu_gyro or not self._filter.initialized:
@@ -694,12 +802,22 @@ class MocapEkfOdom(Node):
         ):
             return
 
-        z_angle = base_link_z_axis_angle_rad(quat_normalize(orientation))
+        orientation_norm = float(np.linalg.norm(orientation))
+        orientation_valid = (
+            all_finite(orientation)
+            and math.isfinite(orientation_norm)
+            and orientation_norm > 1e-12
+        )
+        z_angle = (
+            base_link_z_axis_angle_rad(quat_normalize(orientation))
+            if orientation_valid
+            else float("inf")
+        )
         z_safe = self._filter._within_gate(
             z_angle,
             self._filter.max_base_link_z_axis_angle_rad,
         )
-        if all_finite(position, orientation) and z_safe:
+        if all_finite(position) and orientation_valid and z_safe:
             self._filter.initialize(position, orientation)
             self._consecutive_full_rejections = 0
             self.get_logger().warn(
@@ -725,6 +843,7 @@ class MocapEkfOdom(Node):
         self._filter = self._filter.reset_copy()
         self._last_filter_sec = None
         self._last_pose_rx_sec = None
+        self._last_pose_accepted_sec = None
         self._consecutive_full_rejections = 0
         self._imu_gyro_lpf = None
 
@@ -734,8 +853,8 @@ class MocapEkfOdom(Node):
 
         now = self._now_sec()
         if (
-            self._last_pose_rx_sec is not None
-            and (now - self._last_pose_rx_sec) > self._max_coast_sec
+            self._last_pose_accepted_sec is not None
+            and (now - self._last_pose_accepted_sec) > self._max_coast_sec
         ):
             self._reset_filter()
             self.get_logger().warn(
@@ -829,7 +948,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

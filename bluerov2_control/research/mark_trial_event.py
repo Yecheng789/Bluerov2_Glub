@@ -34,7 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--note", default="", help="Free-text note stored with the event.")
     parser.add_argument("--topic", default="/bluerov2/trial_event", help="std_msgs/String event topic.")
     parser.add_argument("--source", default=getpass.getuser(), help="Event source label.")
-    parser.add_argument("--repeat", type=int, default=3, help="Number of times to publish the event.")
+    parser.add_argument("--repeat", type=int, default=1, help="Number of times to publish the event.")
+    parser.add_argument(
+        "--wait-for-subscriber-sec",
+        type=float,
+        default=2.0,
+        help="Wait this long for the logger before publishing.",
+    )
     return parser
 
 
@@ -59,13 +65,25 @@ def main(argv: Optional[List[str]] = None) -> None:
     msg.data = json.dumps(payload, sort_keys=True)
 
     try:
+        deadline = time.monotonic() + max(0.0, args.wait_for_subscriber_sec)
+        while (
+            node.publisher.get_subscription_count() == 0
+            and time.monotonic() < deadline
+        ):
+            rclpy.spin_once(node, timeout_sec=0.05)
+        if node.publisher.get_subscription_count() == 0:
+            raise RuntimeError(
+                "no trial-event subscriber found; start the experiment logger "
+                "before marking events"
+            )
         for _ in range(max(1, args.repeat)):
             node.publisher.publish(msg)
             rclpy.spin_once(node, timeout_sec=0.05)
             time.sleep(0.05)
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

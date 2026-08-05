@@ -74,96 +74,54 @@ source install/setup.bash
 
 ## Recording a Fixed Hook Target in the Pool
 
-After starting the MoCap EKF, hold the robot at the pose where the tool is
-already hooked into the box handle. Then record an averaged target pose directly
-from `/mocap/glub/odom_ekf`:
+The current real-pool milestone is deliberately narrower than the complete
+retrieval mission: manually hook the target, record that stable pose from raw
+MoCap, then track a slow trajectory back to the recorded pose and hold it.
+
+Use the complete guarded procedure and terminal commands in
+[`FIXED_HOOK_POSE_VALIDATION_ZH.md`](FIXED_HOOK_POSE_VALIDATION_ZH.md).
+
+The target must be recorded directly from `/mocap/glub_fb/pose`, not from EKF
+odometry that can briefly coast through a raw MoCap dropout:
 
 ```bash
 ros2 run bluerov2_control record_mocap_target_pose \
-  --topic /mocap/glub/odom_ekf \
-  --message-type odom \
-  --samples 80 \
-  --output-file /home/yecheng/bluerov_ws/src/bluerov2_control/experiments/payload_retrieval/config/hooked_box_target_pose_from_ekf.json
+  --topic /mocap/glub_fb/pose \
+  --message-type pose \
+  --samples 160 \
+  --timeout-sec 20 \
+  --max-message-age-sec 0.20 \
+  --output-file /absolute/path/to/a/new_hooked_target.json
 ```
 
-This generates a new target JSON file. For later fixed-target validation and
-data logging, prefer this file recorded directly from the EKF topic instead of
-manually copying values from a terminal screenshot.
+Archived target JSON files that name `/mocap/glub/...` or
+`/mocap/glub_4/...` retain their original provenance and must not be
+relabelled. Record a new validated target after the rigid-body rename.
 
 ## Automatic Fixed-Hook MPC Test
 
-The current June 23 baseline is connected to MPC trajectory tracking. After
-confirming that the MoCap software on the lab computer publishes
-`/mocap/glub/pose` stably, calibrate and verify the corrected EKF first.
-
-If markers were reattached, the Qualisys rigid body was redefined, or the
-corrected EKF is still rejected because of `base_link_z_axis_angle`, keep the
-robot physically level and still, then run:
+The real experiment uses a fail-closed launch. The current `glub_fb` target,
+NED/FRD frames, standard real-robot model, pool bounds, command limits, and
+target MAV IDs are stored as launch defaults, so the validated pipeline starts
+with one command:
 
 ```bash
-ros2 run bluerov2_control calibrate_mocap_orientation_correction \
-  --topic /mocap/glub/pose \
-  --samples 120
+ros2 launch bluerov2_control fixed_hook_pose_validation.launch.py
 ```
 
-The command prints a new `orientation_correction_quat_xyzw`. Use that value for
-the EKF test below and for the fixed-hook launch.
+The guarded sequence is now pre-approach, straight final approach, a
+continuous five-second hold at the recorded pose, then a straight retreat to
+the pre-approach pose. MoCap remains the position/attitude source, while the
+MPC body-rate state is overridden by the low-latency BODY_FRD angular velocity
+from `/glub/fmu/out/vehicle_odometry`. The adapter withholds controller
+odometry if that PX4 rate is missing or stale.
 
-Terminal A:
-
-```bash
-ros2 launch bluerov2_control mocap_ekf_odom.launch.py \
-  rigid_body_name:=glub \
-  orientation_correction_quat_xyzw:="0.04430086214711217 -0.001252015250325171 -5.551990616173286e-05 0.9990174487907484"
-```
-
-Terminal B:
-
-```bash
-ros2 topic hz /mocap/glub/pose
-ros2 topic hz /mocap/glub/odom_ekf
-ros2 topic hz /mocap/glub/vehicle_odometry_ekf
-```
-
-After the EKF is stable, stop the standalone EKF in Terminal A and start the
-complete fixed-hook MPC launch:
-
-```bash
-ros2 launch bluerov2_control fixed_hook_mpc_june23.launch.py
-```
-
-This launch starts the MoCap EKF, the `nav_msgs/Odometry` to
-`px4_msgs/VehicleOdometry` adapter, the offboard heartbeat, MPC trajectory
-tracking, and data logging. It also sets the `/home/yecheng/acados` related
-`ACADOS_SOURCE_DIR` and `LD_LIBRARY_PATH` for the MPC process. The MPC includes
-an odometry timeout guard; if MoCap / EKF odometry is not updated for more than
-0.30 s, it publishes zero thrust / torque.
-
-By default, `fixed_hook_mpc_june23.launch.py` applies a fixed rotation
-correction to the `glub` MoCap orientation and applies the same correction to
-the orientation in older target JSON files. The current correction comes from a
-2026-06-28 level-and-still calibration; after correction, the maximum
-base-link z-axis angle is about 0.34 deg. If the rigid-body axes are redefined
-in Qualisys, recalibrate or set `orientation_correction_quat_xyzw` back to an
-empty string.
-
-Keep low saturation limits for the first real pool test:
-
-```bash
-ros2 launch bluerov2_control fixed_hook_mpc_june23.launch.py \
-  thrust_sat:=0.04 \
-  torque_sat:=0.05
-```
-
-If the robot keeps spinning or MoCap warnings persist, stop the launch
-immediately and do not increase the saturation limits yet.
-
-If the real PX4 topics use `/itrl_rov_1` instead of `/glub`:
-
-```bash
-ros2 launch bluerov2_control fixed_hook_mpc_june23.launch.py \
-  robot_namespace:=/itrl_rov_1
-```
+`fixed_hook_mpc_june23.launch.py` remains only as a compatibility wrapper for
+this guarded launch. Do not run `stabilized_control_real.launch.py` or another
+Offboard/controller launch at the same time: they publish to the same heartbeat,
+thrust, and torque topics. Starting the fixed-hook launch does not arm the
+vehicle, request Offboard, or permit MPC motion. Those are separate operator
+actions documented in the Chinese procedure.
 
 Standard `/itrl_rov_1` simulation experiment:
 
@@ -174,7 +132,9 @@ ros2 launch bluerov2_control payload_retrieval_data_collection.launch.py \
   metadata_file:=/home/yecheng/bluerov_ws/src/bluerov2_control/experiments/payload_retrieval/config/trial_metadata_template.json
 ```
 
-Pool experiment with MoCap recording:
+The generic data-collection launch below is retained for legacy experiments;
+it is not the current `/glub` fixed-hook control path and must not be run in
+parallel with the guarded launch:
 
 ```bash
 ros2 launch bluerov2_control payload_retrieval_data_collection.launch.py \
@@ -219,22 +179,24 @@ ros2 run bluerov2_control analyze_payload_retrieval_trial \
   /home/yecheng/bluerov_ws/bluerov2_payload_retrieval_trials/retrieval_YYYYMMDD_HHMMSS
 ```
 
-If the experiment did not publish payload / dock poses, pass static target
-points manually:
+If a simulation experiment did not publish payload / dock poses, pass static
+target points manually. The coordinates below are simulation examples and are
+not measurements of the 9 x 5 x 3 m real pool:
 
 ```bash
 ros2 run bluerov2_control analyze_payload_retrieval_trial \
   /home/yecheng/bluerov_ws/bluerov2_payload_retrieval_trials/retrieval_YYYYMMDD_HHMMSS \
-  --payload-target -1.0,-2.0,95.7 \
-  --dock-target 0.0,0.0,95.7
+  --payload-target=-1.0,-2.0,95.7 \
+  --dock-target=0.0,0.0,95.7
 ```
 
-For safety-boundary analysis, pass tank bounds:
+For simulation safety-boundary analysis, pass the matching simulated bounds.
+Never reuse this example as real-pool bounds:
 
 ```bash
 ros2 run bluerov2_control analyze_payload_retrieval_trial \
   /home/yecheng/bluerov_ws/bluerov2_payload_retrieval_trials/retrieval_YYYYMMDD_HHMMSS \
-  --tank-bounds -4.5,4.5,-2.5,2.5,94.2,97.2
+  --tank-bounds=-4.5,4.5,-2.5,2.5,94.2,97.2
 ```
 
 Analysis results are written to the trial directory under `analysis/`:

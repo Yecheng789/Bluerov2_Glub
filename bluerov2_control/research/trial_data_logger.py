@@ -37,7 +37,7 @@ def _utc_now_iso() -> str:
 
 
 def _default_trial_id() -> str:
-    return "retrieval_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    return "retrieval_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -128,6 +128,10 @@ SAMPLE_FIELDS = (
         "last_event_age_s",
         "armed",
         "offboard",
+        "offboard_request_enable",
+        "offboard_request_enable_age_s",
+        "mission_enable",
+        "mission_enable_age_s",
         "manual_enabled",
         "attitude_enabled",
         "position_enabled",
@@ -199,6 +203,8 @@ class PayloadRetrievalDataLogger(Node):
         )
         self.declare_parameter("sample_period_s", 0.05)
         self.declare_parameter("flush_every_n_samples", 10)
+        self.declare_parameter("stale_after_s", 0.5)
+        self.declare_parameter("event_dedup_window_s", 0.5)
         self.declare_parameter("metadata_file", "")
         self.declare_parameter("controller_name", "")
         self.declare_parameter("environment", "sim_or_pool")
@@ -212,6 +218,8 @@ class PayloadRetrievalDataLogger(Node):
         self.declare_parameter("torque_sp_topic", "/itrl_rov_1/fmu/in/vehicle_torque_setpoint")
         self.declare_parameter("attitude_sp_topic", "")
         self.declare_parameter("control_mode_topic", "/itrl_rov_1/fmu/out/vehicle_control_mode")
+        self.declare_parameter("offboard_request_enable_topic", "")
+        self.declare_parameter("mission_enable_topic", "")
         self.declare_parameter("handle_pose_topic", "/payload/handle_pose")
         self.declare_parameter("handle_confidence_topic", "/payload/handle_confidence")
         self.declare_parameter("handle_detected_topic", "/payload/handle_detected")
@@ -223,7 +231,7 @@ class PayloadRetrievalDataLogger(Node):
         output_dir = Path(_as_str(self.get_parameter("output_dir").value)).expanduser()
         self.trial_id = trial_id
         self.trial_dir = output_dir / trial_id
-        self.trial_dir.mkdir(parents=True, exist_ok=True)
+        self.trial_dir.mkdir(parents=True, exist_ok=False)
 
         self.sample_path = self.trial_dir / "samples.csv"
         self.event_path = self.trial_dir / "events.csv"
@@ -243,6 +251,7 @@ class PayloadRetrievalDataLogger(Node):
         self.closed = False
         self.last_event = ""
         self.last_event_ros_s: Optional[float] = None
+        self._last_event_signature = None
 
         self._write_metadata()
         self._create_subscriptions()
@@ -284,6 +293,8 @@ class PayloadRetrievalDataLogger(Node):
             "torque_sp_topic",
             "attitude_sp_topic",
             "control_mode_topic",
+            "offboard_request_enable_topic",
+            "mission_enable_topic",
             "handle_pose_topic",
             "handle_confidence_topic",
             "handle_detected_topic",
@@ -301,6 +312,10 @@ class PayloadRetrievalDataLogger(Node):
             "operator": _as_str(self.get_parameter("operator").value),
             "notes": _as_str(self.get_parameter("notes").value),
             "sample_period_s": _as_float(self.get_parameter("sample_period_s").value, 0.05),
+            "stale_after_s": _as_float(
+                self.get_parameter("stale_after_s").value,
+                0.5,
+            ),
             "topics": {name: self._topic_param(name) for name in topic_params},
             "machine": {
                 "hostname": platform.node(),
@@ -341,6 +356,18 @@ class PayloadRetrievalDataLogger(Node):
         self._subscribe("torque", self._topic_param("torque_sp_topic"), VehicleTorqueSetpoint, px4_qos)
         self._subscribe("attitude_sp", self._topic_param("attitude_sp_topic"), VehicleAttitudeSetpoint, px4_qos)
         self._subscribe("control_mode", self._topic_param("control_mode_topic"), VehicleControlMode, px4_qos)
+        self._subscribe(
+            "offboard_request_enable",
+            self._topic_param("offboard_request_enable_topic"),
+            Bool,
+            general_qos,
+        )
+        self._subscribe(
+            "mission_enable",
+            self._topic_param("mission_enable_topic"),
+            Bool,
+            general_qos,
+        )
         self._subscribe("handle", self._topic_param("handle_pose_topic"), PoseStamped, general_qos)
         self._subscribe("handle_confidence", self._topic_param("handle_confidence_topic"), Float32, general_qos)
         self._subscribe("handle_detected", self._topic_param("handle_detected_topic"), Bool, general_qos)
@@ -383,8 +410,24 @@ class PayloadRetrievalDataLogger(Node):
         now_s = self._ros_now_s()
         elapsed_s = self._elapsed_s(now_s)
         event = _as_str(event).strip()
+        signature = (event, _as_str(note), _as_str(source))
+        dedup_window_s = max(
+            0.0,
+            _as_float(
+                self.get_parameter("event_dedup_window_s").value,
+                0.5,
+            ),
+        )
+        if (
+            self._last_event_signature == signature
+            and self.last_event_ros_s is not None
+            and now_s - self.last_event_ros_s <= dedup_window_s
+        ):
+            self.get_logger().debug(f"ignored duplicate event: {event}")
+            return
         self.last_event = event
         self.last_event_ros_s = now_s
+        self._last_event_signature = signature
         self.event_writer.writerow(
             {
                 "trial_id": self.trial_id,
@@ -419,6 +462,8 @@ class PayloadRetrievalDataLogger(Node):
         )
 
         self._put_control_mode(row, now_s)
+        self._put_gate_state(row, "offboard_request_enable", now_s)
+        self._put_gate_state(row, "mission_enable", now_s)
         self._put_px4_odom(row, "odom", now_s)
         self._put_nav_odom(row, "mocap", now_s)
         self._put_twist(row, "cmd", now_s)
@@ -441,12 +486,39 @@ class PayloadRetrievalDataLogger(Node):
         return self.latest.get(key, LatestMessage())
 
     def _set_valid_age(self, row: Dict[str, Any], prefix: str, latest: LatestMessage, now_s: float) -> bool:
-        row[f"{prefix}_valid"] = 1 if latest.valid() else 0
-        row[f"{prefix}_age_s"] = "" if not latest.valid() else f"{latest.age_s(now_s):.9f}"
-        return latest.valid()
+        seen = latest.valid()
+        age_s = latest.age_s(now_s) if seen else None
+        stale_after_s = _as_float(
+            self.get_parameter("stale_after_s").value,
+            0.5,
+        )
+        fresh = bool(
+            seen
+            and (
+                stale_after_s <= 0.0
+                or (age_s is not None and age_s <= stale_after_s)
+            )
+        )
+        row[f"{prefix}_valid"] = 1 if fresh else 0
+        row[f"{prefix}_age_s"] = "" if age_s is None else f"{age_s:.9f}"
+        return fresh
 
     def _put_control_mode(self, row: Dict[str, Any], now_s: float) -> None:
         latest = self._latest("control_mode")
+        age_s = latest.age_s(now_s) if latest.valid() else None
+        stale_after_s = _as_float(
+            self.get_parameter("stale_after_s").value,
+            0.5,
+        )
+        if (
+            not latest.valid()
+            or (
+                stale_after_s > 0.0
+                and age_s is not None
+                and age_s > stale_after_s
+            )
+        ):
+            return
         msg = latest.msg
         row["armed"] = "" if msg is None else int(bool(getattr(msg, "flag_armed", False)))
         row["offboard"] = "" if msg is None else int(bool(getattr(msg, "flag_control_offboard_enabled", False)))
@@ -454,8 +526,20 @@ class PayloadRetrievalDataLogger(Node):
         row["attitude_enabled"] = "" if msg is None else int(bool(getattr(msg, "flag_control_attitude_enabled", False)))
         row["position_enabled"] = "" if msg is None else int(bool(getattr(msg, "flag_control_position_enabled", False)))
         row["velocity_enabled"] = "" if msg is None else int(bool(getattr(msg, "flag_control_velocity_enabled", False)))
-        if latest.valid():
-            row["last_event_age_s"] = row["last_event_age_s"]
+
+    def _put_gate_state(
+        self,
+        row: Dict[str, Any],
+        key: str,
+        now_s: float,
+    ) -> None:
+        """Log the persistent state commanded by the latest gate message."""
+        latest = self._latest(key)
+        if not latest.valid() or latest.msg is None:
+            return
+        row[key] = int(bool(latest.msg.data))
+        age_s = latest.age_s(now_s)
+        row[f"{key}_age_s"] = "" if age_s is None else f"{age_s:.9f}"
 
     def _put_px4_odom(self, row: Dict[str, Any], prefix: str, now_s: float) -> None:
         latest = self._latest(prefix)
@@ -608,7 +692,8 @@ def main() -> None:
     finally:
         node.close()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

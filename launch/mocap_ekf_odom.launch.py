@@ -75,7 +75,7 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument("rigid_body_name", default_value="glub"),
+            DeclareLaunchArgument("rigid_body_name", default_value="glub_fb"),
             DeclareLaunchArgument("pose_topic", default_value=""),
             DeclareLaunchArgument("odom_topic", default_value=""),
             DeclareLaunchArgument(

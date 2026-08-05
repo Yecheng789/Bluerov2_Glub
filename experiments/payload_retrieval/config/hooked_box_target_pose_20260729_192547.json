@@ -1,0 +1,72 @@
+{
+  "description": "Averaged fixed hook target pose recorded from MoCap.",
+  "frame_id": "mocap",
+  "message_type": "geometry_msgs/PoseStamped",
+  "notes": [
+    "Record this while the robot is physically held at the hook-engaged pose.",
+    "Use the same topic that the validation logger records."
+  ],
+  "recorded_wall_utc": "2026-07-29T17:25:49.673+00:00",
+  "sample_count": 160,
+  "sample_standard_deviation": {
+    "orientation_angular_std_deg": 0.5518098988014745,
+    "position_m": {
+      "x": 0.0035441690571775537,
+      "y": 0.003868737308266599,
+      "z": 0.004050496964507695
+    }
+  },
+  "source_topic": "/mocap/glub_fb/pose",
+  "target_pose": {
+    "orientation_xyzw": {
+      "w": 0.9993179037978902,
+      "x": -0.005554712854345759,
+      "y": 0.01177010002658454,
+      "z": 0.03455918198483321
+    },
+    "position": {
+      "x": 4.025488682556152,
+      "y": 1.3890867706298828,
+      "z": 1.8178175910949708
+    }
+  },
+  "validation": {
+    "failures": [],
+    "metrics": {
+      "accepted_sample_count": 160,
+      "distinct_header_timestamp_count": 160,
+      "header_timestamped_sample_count": 160,
+      "max_axis_position_standard_deviation_m": 0.004050496964507695,
+      "message_age_sec": {
+        "max": 0.009326678000000001,
+        "mean": 0.00720507693125,
+        "min": 0.005332982
+      },
+      "orientation": {
+        "angular_std_deg": 0.5518098988014745,
+        "max_deviation_deg": 1.5070559650204942,
+        "pairwise_spread_deg": 2.3132224430969957
+      },
+      "position_standard_deviation_m": {
+        "x": 0.0035441690571775537,
+        "y": 0.003868737308266599,
+        "z": 0.004050496964507695
+      },
+      "rejected_sample_count": 0,
+      "rejected_samples_by_reason": {},
+      "sampling_span_sec": 1.581276198,
+      "sampling_span_source": "header_timestamp"
+    },
+    "passed": true,
+    "settings": {
+      "max_future_timestamp_skew_sec": 0.1,
+      "max_message_age_sec": 0.2,
+      "max_orientation_angular_std_deg": 1.5,
+      "max_orientation_pairwise_spread_deg": 5.0,
+      "max_position_standard_deviation_m": 0.015,
+      "min_sampling_span_sec": 0.75,
+      "quaternion_minimum_norm": 1e-06,
+      "required_sample_count": 160
+    }
+  }
+}

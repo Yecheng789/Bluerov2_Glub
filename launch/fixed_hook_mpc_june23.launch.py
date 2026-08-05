@@ -1,285 +1,126 @@
-import json
-import math
-import os
-from pathlib import Path
+#!/usr/bin/env python3
+"""Compatibility wrapper for the guarded fixed-hook reality validation."""
 
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
 
 
-DEFAULT_ORIENTATION_CORRECTION_QUAT_XYZW = (
-    "0.04430086214711217 -0.001252015250325171 "
-    "-5.551990616173286e-05 0.9990174487907484"
+FORWARDED_ARGUMENTS = (
+    'rigid_body_name',
+    'robot_namespace',
+    'target_config',
+    'mocap_world_frame',
+    'pool_bounds_mocap',
+    'pool_safety_margin_m',
+    'mocap_body_frame',
+    'robot_type',
+    'orientation_correction_quat_xyzw',
+    'target_orientation_correction_mode',
+    'traj_speed_mps',
+    'pre_approach_speed_mps',
+    'final_approach_speed_mps',
+    'min_traj_duration_s',
+    'pre_approach_distance_m',
+    'fixed_hook_depth_tolerance_m',
+    'traj_angular_speed_deg_s',
+    'final_pose_hold_s',
+    'retreat_speed_mps',
+    'px4_angular_velocity_timeout_sec',
+    'w_att',
+    'w_omega',
+    'w_u_torque',
+    'position_integral_gain_N_per_m_s',
+    'position_integral_force_limit_fraction',
+    'position_integral_activation_error_m',
+    'thrust_sat',
+    'torque_sat',
+    'max_initial_goal_distance_m',
+    'max_initial_goal_orientation_error_deg',
+    'max_odom_position_jump_m',
+    'max_odom_orientation_jump_deg',
+    'max_raw_mocap_message_age_sec',
+    'max_mocap_coast_sec',
+    'target_system_id',
+    'target_component_id',
+    'source_system_id',
+    'source_component_id',
+    'trial_output_dir',
+    'trial_id',
+    'acados_source_dir',
+    'rebuild_solver',
 )
 
 
-def _quat_normalize(q):
-    x, y, z, w = [float(v) for v in q]
-    norm = math.sqrt(x * x + y * y + z * z + w * w)
-    if norm <= 1e-12 or not math.isfinite(norm):
-        return (0.0, 0.0, 0.0, 1.0)
-    x, y, z, w = x / norm, y / norm, z / norm, w / norm
-    if w < 0.0:
-        x, y, z, w = -x, -y, -z, -w
-    return (x, y, z, w)
-
-
-def _quat_multiply_xyzw(q1, q2):
-    x1, y1, z1, w1 = _quat_normalize(q1)
-    x2, y2, z2, w2 = _quat_normalize(q2)
-    return _quat_normalize(
-        (
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        )
-    )
-
-
-def _parse_quat_xyzw(text):
-    text = str(text).strip()
-    if not text:
-        return (0.0, 0.0, 0.0, 1.0)
-    values = [float(value) for value in text.replace(",", " ").split()]
-    if len(values) != 4:
-        raise ValueError(
-            "orientation_correction_quat_xyzw must contain four values: "
-            "x y z w"
-        )
-    return _quat_normalize(values)
-
-
-def _parse_bool(text):
-    return str(text).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _quat_xyzw_to_rpy(q):
-    x, y, z, w = q
-    sinr_cosp = 2.0 * (w * x + y * z)
-    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-
-    sinp = 2.0 * (w * y - z * x)
-    pitch = math.asin(max(-1.0, min(1.0, sinp)))
-
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-    return roll, pitch, yaw
-
-
-def _load_target(path, orientation_correction=None):
-    with Path(path).expanduser().open("r", encoding="utf-8") as src:
-        payload = json.load(src)
-    target = payload["target_pose"]
-    position = target["position"]
-    quat = target["orientation_xyzw"]
-    quat_xyzw = (
-        float(quat["x"]),
-        float(quat["y"]),
-        float(quat["z"]),
-        float(quat["w"]),
-    )
-    if orientation_correction is not None:
-        quat_xyzw = _quat_multiply_xyzw(quat_xyzw, orientation_correction)
-    roll, pitch, yaw = _quat_xyzw_to_rpy(
-        quat_xyzw
-    )
-    return {
-        "x": float(position["x"]),
-        "y": float(position["y"]),
-        "z": float(position["z"]),
-        "roll": roll,
-        "pitch": pitch,
-        "yaw": yaw,
-    }
-
-
-def _make_nodes(context, *args, **kwargs):
-    target_config = LaunchConfiguration("target_config").perform(context)
-    rigid_body_name = LaunchConfiguration("rigid_body_name").perform(context)
-    robot_ns = LaunchConfiguration("robot_namespace").perform(context).rstrip("/")
-    orientation_correction_text = LaunchConfiguration(
-        "orientation_correction_quat_xyzw"
-    ).perform(context)
-    apply_target_correction = _parse_bool(
-        LaunchConfiguration("apply_orientation_correction_to_target").perform(
-            context
-        )
-    )
-    orientation_correction = _parse_quat_xyzw(orientation_correction_text)
-    target = _load_target(
-        target_config,
-        orientation_correction if apply_target_correction else None,
-    )
-
-    nav_odom_topic = f"/mocap/{rigid_body_name}/odom_ekf"
-    vehicle_odom_topic = f"/mocap/{rigid_body_name}/vehicle_odometry_ekf"
-
-    heartbeat = Node(
-        package="bluerov2_control",
-        executable="offboard_heartbeat_wrench",
-        name="offboard_heartbeat_wrench",
-        output="screen",
-        parameters=[
-            {
-                "topic": f"{robot_ns}/fmu/in/offboard_control_mode",
-            }
-        ],
-    )
-
-    mocap_ekf = Node(
-        package="bluerov2_control",
-        executable="mocap_ekf_odom",
-        name="mocap_ekf_odom",
-        output="screen",
-        parameters=[
-            {
-                "rigid_body_name": rigid_body_name,
-                "pose_topic": f"/mocap/{rigid_body_name}/pose",
-                "odom_topic": nav_odom_topic,
-                "publish_rate_hz": 80.0,
-                "publish_tf": True,
-                "use_imu_gyro": False,
-                "orientation_correction_quat_xyzw": orientation_correction_text,
-                "max_coast_sec": 1.0,
-                "max_rejected_samples": 200,
-            }
-        ],
-    )
-
-    odom_adapter = Node(
-        package="bluerov2_control",
-        executable="nav_odom_to_vehicle_odometry",
-        name="nav_odom_to_vehicle_odometry",
-        output="screen",
-        parameters=[
-            {
-                "input_odom_topic": nav_odom_topic,
-                "output_vehicle_odometry_topic": vehicle_odom_topic,
-                "pose_frame": "frd",
-                "velocity_frame": "body_frd",
-            }
-        ],
-    )
-
-    mpc = Node(
-        package="bluerov2_control",
-        executable="mpc_track_trajectory_acados",
-        name="mpc_track_trajectory_acados_fixed_hook",
-        output="screen",
-        parameters=[
-            {
-                "odom_topic": vehicle_odom_topic,
-                "control_mode_topic": f"{robot_ns}/fmu/out/vehicle_control_mode",
-                "thrust_sp_topic": f"{robot_ns}/fmu/in/vehicle_thrust_setpoint",
-                "torque_sp_topic": f"{robot_ns}/fmu/in/vehicle_torque_setpoint",
-                "goal_x": target["x"],
-                "goal_y": target["y"],
-                "goal_z": target["z"],
-                "goal_roll": target["roll"],
-                "goal_pitch": target["pitch"],
-                "goal_yaw": target["yaw"],
-                "hold_attitude": True,
-                "traj_mode": "linear",
-                "traj_speed_mps": float(
-                    LaunchConfiguration("traj_speed_mps").perform(context)
-                ),
-                "min_traj_duration_s": 5.0,
-                "goal_reached_tol_m": 0.05,
-                "regenerate_on_goal_change": False,
-                "planner_mode": "none",
-                "use_box_recovery_mission": False,
-                "Ts": 0.04,
-                "N": 25,
-                "solve_rate_hz": 25.0,
-                "model_type": "fossen",
-                "w_pos": 50.0,
-                "w_vel": 15.0,
-                "w_att": 20.0,
-                "w_omega": 4.0,
-                "w_u_force": 0.1,
-                "w_u_torque": 0.05,
-                "Fx_max_N": 88.0,
-                "Fy_max_N": 88.0,
-                "Fz_max_N": 137.0,
-                "Mx_max_Nm": 30.0,
-                "My_max_Nm": 16.5,
-                "Mz_max_Nm": 21.0,
-                "thrust_sat": float(
-                    LaunchConfiguration("thrust_sat").perform(context)
-                ),
-                "torque_sat": float(
-                    LaunchConfiguration("torque_sat").perform(context)
-                ),
-                "publish_dt": 0.02,
-                "odom_timeout_s": 0.30,
-                "codegen_dir": "/tmp/bluerov2_acados_fixed_hook",
-                "rebuild_solver": False,
-            }
-        ],
-    )
-
-    logger = Node(
-        package="bluerov2_control",
-        executable="payload_retrieval_data_logger",
-        name="payload_retrieval_data_logger_fixed_hook",
-        output="screen",
-        parameters=[
-            {
-                "controller_name": "mpc_fixed_hook_june23",
-                "environment": "kth_pool",
-                "metadata_file": target_config,
-                "mocap_odom_topic": nav_odom_topic,
-                "odom_topic": vehicle_odom_topic,
-                "control_mode_topic": f"{robot_ns}/fmu/out/vehicle_control_mode",
-                "thrust_sp_topic": f"{robot_ns}/fmu/in/vehicle_thrust_setpoint",
-                "torque_sp_topic": f"{robot_ns}/fmu/in/vehicle_torque_setpoint",
-                "cmd_vel_topic": "",
-            }
-        ],
-    )
-
-    return [heartbeat, mocap_ekf, odom_adapter, mpc, logger]
+DEFAULTS = {
+    'rigid_body_name': 'glub_fb',
+    'robot_namespace': '/glub',
+    'target_config': (
+        '/home/yecheng/bluerov_ws/src/bluerov2_control/'
+        'experiments/payload_retrieval/config/'
+        'hooked_box_target_pose_20260802_195146.json'
+    ),
+    'mocap_world_frame': 'ned',
+    'pool_bounds_mocap': '0 9 -2.5 2.5 0 3',
+    'pool_safety_margin_m': '0.25',
+    'mocap_body_frame': 'frd',
+    'robot_type': 'standard',
+    'orientation_correction_quat_xyzw': '',
+    'target_orientation_correction_mode': 'auto',
+    'traj_speed_mps': '0.05',
+    'pre_approach_speed_mps': '0.06',
+    'final_approach_speed_mps': '0.04',
+    'min_traj_duration_s': '5.0',
+    'pre_approach_distance_m': '0.50',
+    'fixed_hook_depth_tolerance_m': '0.03',
+    'traj_angular_speed_deg_s': '8.0',
+    'final_pose_hold_s': '5.0',
+    'retreat_speed_mps': '0.04',
+    'px4_angular_velocity_timeout_sec': '0.10',
+    'w_att': '10.0',
+    'w_omega': '20.0',
+    'w_u_torque': '0.5',
+    'position_integral_gain_N_per_m_s': '3.0',
+    'position_integral_force_limit_fraction': '0.07',
+    'position_integral_activation_error_m': '0.50',
+    'thrust_sat': '0.12',
+    'torque_sat': '0.02',
+    'max_initial_goal_distance_m': '0',
+    'max_initial_goal_orientation_error_deg': '0',
+    'max_odom_position_jump_m': '0.20',
+    'max_odom_orientation_jump_deg': '20.0',
+    'max_raw_mocap_message_age_sec': '0.20',
+    'max_mocap_coast_sec': '2.0',
+    'target_system_id': '3',
+    'target_component_id': '1',
+    'source_system_id': '1',
+    'source_component_id': '191',
+    'trial_output_dir': (
+        '/home/yecheng/bluerov_ws/bluerov2_payload_retrieval_trials'
+    ),
+    'trial_id': '',
+    'acados_source_dir': '/home/yecheng/acados',
+    'rebuild_solver': 'false',
+}
 
 
 def generate_launch_description():
-    acados_source_dir = "/home/yecheng/acados"
-    acados_lib_dir = f"{acados_source_dir}/lib"
-    ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if ld_library_path:
-        ld_library_path = f"{acados_lib_dir}:{ld_library_path}"
-    else:
-        ld_library_path = acados_lib_dir
-
-    return LaunchDescription(
-        [
-            SetEnvironmentVariable("ACADOS_SOURCE_DIR", acados_source_dir),
-            SetEnvironmentVariable("LD_LIBRARY_PATH", ld_library_path),
-            DeclareLaunchArgument("rigid_body_name", default_value="glub"),
-            DeclareLaunchArgument("robot_namespace", default_value="/glub"),
-            DeclareLaunchArgument(
-                "target_config",
-                default_value=(
-                    "/home/yecheng/bluerov_ws/src/bluerov2_control/"
-                    "experiments/payload_retrieval/config/"
-                    "hooked_box_target_pose_trial_baseline.json"
-                ),
-            ),
-            DeclareLaunchArgument("traj_speed_mps", default_value="0.04"),
-            DeclareLaunchArgument("thrust_sat", default_value="0.04"),
-            DeclareLaunchArgument("torque_sat", default_value="0.05"),
-            DeclareLaunchArgument(
-                "orientation_correction_quat_xyzw",
-                default_value=DEFAULT_ORIENTATION_CORRECTION_QUAT_XYZW,
-            ),
-            DeclareLaunchArgument(
-                "apply_orientation_correction_to_target",
-                default_value="true",
-            ),
-            OpaqueFunction(function=_make_nodes),
-        ]
+    """Forward the old launch name to the new fail-closed experiment."""
+    launch_path = (
+        get_package_share_directory('bluerov2_control')
+        + '/launch/fixed_hook_pose_validation.launch.py'
     )
+    declarations = [
+        DeclareLaunchArgument(name, default_value=DEFAULTS[name])
+        for name in FORWARDED_ARGUMENTS
+    ]
+    included = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(launch_path),
+        launch_arguments={
+            name: LaunchConfiguration(name)
+            for name in FORWARDED_ARGUMENTS
+        }.items(),
+    )
+    return LaunchDescription([*declarations, included])
