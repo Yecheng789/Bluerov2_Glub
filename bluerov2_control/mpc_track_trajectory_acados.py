@@ -1991,6 +1991,10 @@ class MPCTrackTrajectoryAcados(Node):
         """Return the nominal level segment for final approach or retreat."""
         if not self._fixed_hook_transit_active():
             return None
+        if not bool(self.get_parameter("hold_attitude").value):
+            raise ValueError(
+                "fixed-hook body-forward transit requires hold_attitude=true"
+            )
 
         hook = self._goal_position_static()
         pre_approach = self._pre_approach_position()
@@ -2002,6 +2006,32 @@ class MPCTrackTrajectoryAcados(Node):
             raise ValueError(
                 "fixed-hook pre-approach and hook poses must have the same "
                 "NED depth"
+            )
+
+        approach_delta_xy = np.asarray(
+            hook[0:2] - pre_approach[0:2],
+            dtype=float,
+        )
+        approach_distance_xy = float(np.linalg.norm(approach_delta_xy))
+        if approach_distance_xy <= 1e-9:
+            raise ValueError(
+                "fixed-hook horizontal approach distance must be positive"
+            )
+        goal_yaw = float(self._goal_yaw_static())
+        if not math.isfinite(goal_yaw):
+            raise ValueError("fixed-hook recorded yaw must be finite")
+        expected_forward_xy = np.array([
+            math.cos(goal_yaw),
+            math.sin(goal_yaw),
+        ], dtype=float)
+        direction_error = float(np.linalg.norm(
+            approach_delta_xy / approach_distance_xy
+            - expected_forward_xy
+        ))
+        if direction_error > 1e-6:
+            raise ValueError(
+                "fixed-hook pre-approach to hook segment must follow the "
+                "recorded body-forward yaw"
             )
 
         if self.mission_state == "FINAL_APPROACH":

@@ -477,6 +477,32 @@ def _quat_wxyz_to_rpy(quat):
     return roll, pitch, yaw
 
 
+def _body_forward_pre_approach_position(
+    target_position,
+    goal_yaw,
+    distance_m,
+):
+    """Place pre-hook behind the recorded horizontal body-forward axis."""
+    target = np.asarray(target_position, dtype=float)
+    yaw = float(goal_yaw)
+    distance = float(distance_m)
+    if target.shape != (3,) or not np.all(np.isfinite(target)):
+        raise RuntimeError('target position must contain three finite values')
+    if not math.isfinite(yaw):
+        raise RuntimeError('target yaw must be finite')
+    if not math.isfinite(distance) or distance <= 0.0:
+        raise RuntimeError('pre-approach distance must be finite and > 0')
+
+    horizontal_forward = np.array(
+        [math.cos(yaw), math.sin(yaw), 0.0],
+        dtype=float,
+    )
+    pre_approach = target - distance * horizontal_forward
+    # Keep the full recorded attitude while commanding a level translation.
+    pre_approach[2] = target[2]
+    return pre_approach
+
+
 def _critical_exit_handler(node, label):
     return RegisterEventHandler(
         OnProcessExit(
@@ -636,16 +662,24 @@ def _launch_setup(context, *args, **kwargs):
         minimum=1.0,
         maximum=90.0,
     )
-    horizontal_forward = np.array(
-        [math.cos(goal_yaw), math.sin(goal_yaw), 0.0],
-        dtype=float,
+    pre_approach_position = _body_forward_pre_approach_position(
+        target_position,
+        goal_yaw,
+        pre_approach_distance,
     )
-    pre_approach_position = (
-        target_position - pre_approach_distance * horizontal_forward
+    pre_approach_line_distance = float(
+        np.linalg.norm(pre_approach_position - target_position)
     )
-    # The waypoint is deliberately level with the recorded hook pose. The
-    # target tilt must not introduce an unintended depth offset here.
-    pre_approach_position[2] = target_position[2]
+    if not math.isclose(
+        pre_approach_line_distance,
+        pre_approach_distance,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise RuntimeError(
+            'body-forward pre-approach construction produced an unexpected '
+            'line length'
+        )
     _require_point_inside_bounds(
         pre_approach_position,
         pool_bounds['operating_min_ned'],
@@ -984,6 +1018,13 @@ def _launch_setup(context, *args, **kwargs):
             'goal_quaternion_wxyz_ned_frd': target_quat.tolist(),
             'use_pre_approach_waypoint': True,
             'pre_approach_distance_m': pre_approach_distance,
+            'pre_approach_line_distance_m': (
+                pre_approach_line_distance
+            ),
+            'pre_approach_geometry': (
+                'recorded_yaw_horizontal_body_forward'
+            ),
+            'pre_approach_forward_yaw_rad': goal_yaw,
             'pre_approach_ned_m': pre_approach_position.tolist(),
             'fixed_hook_depth_tolerance_m': (
                 fixed_hook_depth_tolerance
@@ -1138,9 +1179,10 @@ def _launch_setup(context, *args, **kwargs):
         f'p=[{pre_approach_position[0]:.3f}, '
         f'{pre_approach_position[1]:.3f}, '
         f'{pre_approach_position[2]:.3f}] m, '
-        f'distance={pre_approach_distance:.3f} m, depth tolerance='
-        f'{fixed_hook_depth_tolerance:.3f} m; the controller will align '
-        'and settle to the common line depth here before advancing.'
+        f'body-forward distance={pre_approach_line_distance:.3f} m, '
+        f'depth tolerance={fixed_hook_depth_tolerance:.3f} m; the controller '
+        'will settle to the recorded attitude and common line depth before '
+        'advancing along the recorded horizontal nose direction.'
     )
     mission_sequence_summary = (
         'Fixed-hook pose sequence: PRE_APPROACH -> FINAL_APPROACH -> '
@@ -1266,10 +1308,9 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'final_approach_speed_mps',
-            default_value='0.04',
+            default_value='0.09',
             description=(
-                'Straight-line reference speed for the final 0.50 m hook '
-                'approach.'
+                'Straight-line reference speed for the final hook approach.'
             ),
         ),
         DeclareLaunchArgument('min_traj_duration_s', default_value='5.0'),
@@ -1278,7 +1319,7 @@ def generate_launch_description():
             default_value='0.50',
             description=(
                 'Horizontal distance behind the recorded final body-forward '
-                'direction used to construct the pre-approach waypoint.'
+                'direction used to construct the pre-hook waypoint.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1305,7 +1346,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'retreat_speed_mps',
-            default_value='0.04',
+            default_value='0.09',
             description=(
                 'Straight-line position-reference speed from the recorded '
                 'hook pose back to pre-approach.'

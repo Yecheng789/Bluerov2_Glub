@@ -207,11 +207,11 @@ def test_fixed_hook_launch_accepts_only_current_rigid_body_target(
     )
     assert context.launch_configurations['traj_speed_mps'] == '0.05'
     assert context.launch_configurations['pre_approach_speed_mps'] == '0.06'
-    assert context.launch_configurations['final_approach_speed_mps'] == '0.04'
+    assert context.launch_configurations['final_approach_speed_mps'] == '0.09'
     assert context.launch_configurations['min_traj_duration_s'] == '5.0'
     assert context.launch_configurations['traj_angular_speed_deg_s'] == '8.0'
     assert context.launch_configurations['final_pose_hold_s'] == '5.0'
-    assert context.launch_configurations['retreat_speed_mps'] == '0.04'
+    assert context.launch_configurations['retreat_speed_mps'] == '0.09'
     assert (
         context.launch_configurations['px4_angular_velocity_timeout_sec']
         == '0.10'
@@ -293,11 +293,11 @@ def test_fixed_hook_compatibility_wrapper_uses_current_real_defaults():
     assert module.DEFAULTS['fixed_hook_depth_tolerance_m'] == '0.03'
     assert module.DEFAULTS['traj_speed_mps'] == '0.05'
     assert module.DEFAULTS['pre_approach_speed_mps'] == '0.06'
-    assert module.DEFAULTS['final_approach_speed_mps'] == '0.04'
+    assert module.DEFAULTS['final_approach_speed_mps'] == '0.09'
     assert module.DEFAULTS['min_traj_duration_s'] == '5.0'
     assert module.DEFAULTS['traj_angular_speed_deg_s'] == '8.0'
     assert module.DEFAULTS['final_pose_hold_s'] == '5.0'
-    assert module.DEFAULTS['retreat_speed_mps'] == '0.04'
+    assert module.DEFAULTS['retreat_speed_mps'] == '0.09'
     assert module.DEFAULTS['px4_angular_velocity_timeout_sec'] == '0.10'
     assert module.DEFAULTS['w_att'] == '10.0'
     assert module.DEFAULTS['w_omega'] == '20.0'
@@ -339,7 +339,7 @@ def test_fixed_hook_compatibility_wrapper_uses_current_real_defaults():
     assert 'max_mocap_coast_sec' in module.FORWARDED_ARGUMENTS
 
 
-def test_new_recorded_target_builds_level_half_metre_pre_approach():
+def test_new_recorded_target_builds_half_metre_body_forward_pre_hook():
     module = _load_launch_module()
     target_path = (
         Path(__file__).resolve().parents[1]
@@ -362,12 +362,11 @@ def test_new_recorded_target_builds_level_half_metre_pre_approach():
     _roll, _pitch, goal_yaw = module._quat_wxyz_to_rpy(
         target_quaternion
     )
-    horizontal_forward = np.array(
-        [np.cos(goal_yaw), np.sin(goal_yaw), 0.0],
-        dtype=float,
+    pre_approach = module._body_forward_pre_approach_position(
+        target_position,
+        goal_yaw,
+        0.50,
     )
-    pre_approach = target_position - 0.50 * horizontal_forward
-    pre_approach[2] = target_position[2]
 
     np.testing.assert_allclose(
         pre_approach,
@@ -375,6 +374,36 @@ def test_new_recorded_target_builds_level_half_metre_pre_approach():
         atol=1e-7,
     )
     assert pre_approach[2] == pytest.approx(target_position[2])
+    approach_delta = target_position - pre_approach
+    assert np.linalg.norm(approach_delta) == pytest.approx(0.50)
+    np.testing.assert_allclose(
+        approach_delta / np.linalg.norm(approach_delta),
+        [np.cos(goal_yaw), np.sin(goal_yaw), 0.0],
+        atol=1e-9,
+    )
+
+
+@pytest.mark.parametrize(
+    ('yaw', 'expected'),
+    [
+        (-np.pi / 2.0, [1.0, 2.5, 3.0]),
+        (np.pi / 2.0, [1.0, 1.5, 3.0]),
+        (0.0, [0.5, 2.0, 3.0]),
+    ],
+)
+def test_pre_hook_is_behind_horizontal_body_forward_direction(
+    yaw,
+    expected,
+):
+    module = _load_launch_module()
+    target = np.array([1.0, 2.0, 3.0])
+    pre_approach = module._body_forward_pre_approach_position(
+        target,
+        yaw,
+        0.5,
+    )
+
+    np.testing.assert_allclose(pre_approach, expected)
 
 
 def test_launch_rejects_pre_approach_waypoint_outside_pool(tmp_path):
@@ -385,8 +414,8 @@ def test_launch_rejects_pre_approach_waypoint_outside_pool(tmp_path):
         'message_type': 'geometry_msgs/PoseStamped',
         'source_topic': '/mocap/glub_fb/pose',
         'target_pose': {
-            # The final target is inside the 0.25 m shrunken pool, but the
-            # default 0.50 m waypoint behind a zero-yaw body is outside it.
+            # The target is inside the 0.25 m shrunken pool, but the 0.50 m
+            # zero-yaw pre-hook point lies outside the minimum X boundary.
             'position': {'x': 0.40, 'y': 0.0, 'z': 1.0},
             'orientation_xyzw': {
                 'x': 0.0,
@@ -842,12 +871,12 @@ def test_fixed_hook_phase_speeds_keep_final_approach_deliberate():
     parameters = {
         'traj_speed_mps': 0.05,
         'forward_pass_speed_mps': 0.04,
-        'backward_pass_speed_mps': 0.04,
+        'backward_pass_speed_mps': 0.09,
     }
     fake = SimpleNamespace(
         mission_state='PRE_APPROACH',
         pre_approach_speed_mps=0.06,
-        final_approach_speed_mps=0.04,
+        final_approach_speed_mps=0.09,
         get_parameter=lambda name: SimpleNamespace(
             value=parameters[name]
         ),
@@ -858,11 +887,11 @@ def test_fixed_hook_phase_speeds_keep_final_approach_deliberate():
     )
     fake.mission_state = 'FINAL_APPROACH'
     assert MPCTrackTrajectoryAcados._phase_traj_speed(fake) == pytest.approx(
-        0.04
+        0.09
     )
     fake.mission_state = 'RETREAT'
     assert MPCTrackTrajectoryAcados._phase_traj_speed(fake) == pytest.approx(
-        0.04
+        0.09
     )
     fake.mission_state = 'COMPLETE'
     assert MPCTrackTrajectoryAcados._phase_traj_speed(fake) == pytest.approx(
@@ -1067,10 +1096,24 @@ def test_pre_approach_completion_rebuilds_final_then_enters_terminal_hold():
 
 
 def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
-    pre_approach = np.array([4.8448, 0.0777, 1.7281], dtype=float)
-    hook = np.array([4.3596, -0.0429, 1.7281], dtype=float)
+    hook = np.array([
+        4.359563864135742,
+        -0.04291881504058838,
+        1.7280517059326173,
+    ], dtype=float)
+    recorded_yaw = -2.897982680307847
+    horizontal_forward = np.array([
+        np.cos(recorded_yaw),
+        np.sin(recorded_yaw),
+        0.0,
+    ])
+    pre_approach = hook - 0.50 * horizontal_forward
     recorded_q = np.array(
-        euler_to_quat_wxyz(0.03, -0.04, -2.90),
+        euler_to_quat_wxyz(
+            -0.08415171490423913,
+            -0.05303880143946147,
+            recorded_yaw,
+        ),
         dtype=float,
     )
     parameters = {
@@ -1091,7 +1134,7 @@ def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
         terminal_hold_goal_signature='old-hold',
         last_goal_signature=None,
         pre_approach_speed_mps=0.06,
-        final_approach_speed_mps=0.04,
+        final_approach_speed_mps=0.09,
         get_parameter=lambda name: SimpleNamespace(
             value=parameters[name]
         ),
@@ -1099,9 +1142,10 @@ def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
         _pre_approach_waypoint_enabled=lambda: True,
         _pre_approach_position=lambda: pre_approach.copy(),
         _goal_position_static=lambda: hook.copy(),
+        _goal_yaw_static=lambda: recorded_yaw,
         _goal_quaternion=lambda: recorded_q.copy(),
         _goal_signature=lambda: ('fixed-hook-goal',),
-        _phase_traj_speed=lambda: 0.04,
+        _phase_traj_speed=lambda: 0.09,
     )
     fake._now_sec = lambda: fake.now_sec
     fake._reset_position_integral = lambda: (
@@ -1143,9 +1187,18 @@ def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
     np.testing.assert_allclose(fake.traj_start_pos, hook)
     np.testing.assert_allclose(fake.traj_goal_pos, pre_approach)
 
-    expected_duration = np.linalg.norm(hook - pre_approach) / 0.04
+    expected_duration = max(
+        np.linalg.norm(hook - pre_approach) / 0.09,
+        5.0,
+    )
     assert forward_duration == pytest.approx(expected_duration)
     assert retreat_duration == pytest.approx(expected_duration)
+    assert forward_duration == pytest.approx(0.50 / 0.09)
+    np.testing.assert_allclose(
+        (hook - pre_approach) / np.linalg.norm(hook - pre_approach),
+        horizontal_forward,
+        atol=1e-9,
+    )
     for index, alpha in enumerate(np.linspace(0.0, 1.0, 5)):
         expected_forward = pre_approach + alpha * (hook - pre_approach)
         np.testing.assert_allclose(forward[index][0:3], expected_forward)
@@ -1163,6 +1216,48 @@ def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
             retreat[index][3:7],
             recorded_q,
         ) == pytest.approx(0.0, abs=1e-9)
+
+
+@pytest.mark.parametrize('wrong_geometry', ['cross_track', 'opposite'])
+def test_fixed_hook_line_rejects_motion_not_aligned_with_recorded_yaw(
+    wrong_geometry,
+):
+    hook = np.array([4.3596, -0.0429, 1.7281], dtype=float)
+    recorded_yaw = -2.897982680307847
+    if wrong_geometry == 'cross_track':
+        pre_approach = np.array([4.3596, 0.4571, 1.7281], dtype=float)
+    else:
+        horizontal_forward = np.array([
+            np.cos(recorded_yaw),
+            np.sin(recorded_yaw),
+            0.0,
+        ])
+        pre_approach = hook + 0.50 * horizontal_forward
+    fake = SimpleNamespace(
+        mission_state='FINAL_APPROACH',
+        _fixed_hook_transit_active=lambda: True,
+        get_parameter=lambda name: SimpleNamespace(
+            value={'hold_attitude': True}[name]
+        ),
+        _goal_position_static=lambda: hook.copy(),
+        _goal_yaw_static=lambda: recorded_yaw,
+        _pre_approach_position=lambda: pre_approach.copy(),
+    )
+
+    with pytest.raises(ValueError, match='recorded body-forward yaw'):
+        MPCTrackTrajectoryAcados._fixed_hook_line_segment(fake)
+
+
+def test_fixed_hook_line_requires_attitude_hold():
+    fake = SimpleNamespace(
+        _fixed_hook_transit_active=lambda: True,
+        get_parameter=lambda name: SimpleNamespace(
+            value={'hold_attitude': False}[name]
+        ),
+    )
+
+    with pytest.raises(ValueError, match='requires hold_attitude=true'):
+        MPCTrackTrajectoryAcados._fixed_hook_line_segment(fake)
 
 
 def test_pre_approach_requires_tighter_depth_before_forward_motion():
