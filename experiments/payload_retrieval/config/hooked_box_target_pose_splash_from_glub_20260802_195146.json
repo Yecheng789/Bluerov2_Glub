@@ -1,0 +1,41 @@
+{
+    "description": "INVALIDATED FOR CONTROL: archived Splash identity-transfer hypothesis derived from a Glub MoCap recording.",
+    "status": "invalidated_for_control",
+  "frame_id": "mocap",
+  "message_type": "geometry_msgs/PoseStamped",
+  "source_topic": "/mocap/glub_fb/pose",
+  "target_pose": {
+    "orientation_xyzw": {
+      "w": -0.12024669146873589,
+      "x": 0.031405617318033464,
+      "y": -0.0385181276784148,
+      "z": 0.9914992557898594
+    },
+    "position": {
+      "x": 4.359563864135742,
+      "y": -0.04291881504058838,
+      "z": 1.7280517059326173
+    }
+  },
+  "notes": [
+    "No Splash samples were recorded for this derived target file.",
+    "The target pose is an exact snapshot of the referenced Glub recording.",
+        "The operator initially confirmed equivalent robot geometry and control settings.",
+        "Trial retrieval_20260818_190143_613458 disproved the identity-pose assumption: Splash reached the pre-hook position but retained 9.22-19.12 degrees of attitude error against this Glub quaternion.",
+        "This file is retained only for provenance and must not be used to control Splash; record a new target from /mocap/splash_fb/pose."
+  ],
+  "derived_target": {
+    "schema_version": 1,
+    "type": "identity_pose_transfer",
+    "source_config": "hooked_box_target_pose_20260802_195146.json",
+    "source_config_sha256": "e61b678f52c9bfe58ebe4b01610a7939a9355c91f2a8f0e81b9699f598316cb7",
+    "source_pose_topic": "/mocap/glub_fb/pose",
+    "destination_pose_topic": "/mocap/splash_fb/pose",
+    "position_offset_m": [0.0, 0.0, 0.0],
+    "orientation_offset_xyzw": [0.0, 0.0, 0.0, 1.0],
+    "operator_confirmed_equivalent_geometry": true,
+        "operator_confirmed_same_target_pose": false,
+        "invalidation_trial_id": "retrieval_20260818_190143_613458",
+        "invalidation_reason": "Cross-rigid-body MoCap orientation identity was disproved by real data."
+  }
+}

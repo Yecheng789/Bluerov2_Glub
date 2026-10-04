@@ -1,70 +1,33 @@
-# Underwater Autonomous Payload Retrieval Experiments: Data Collection and Thesis Analysis Plan
+# Fixed-Target Payload Retrieval Experiments
 
-This directory supports the thesis topic:
+This directory contains procedures, metadata templates, and analysis tools for
+fixed-target payload-retrieval experiments. The current pool experiment uses
+a recorded hook pose, an A*/NMPC approach, straight-line engagement, an
+operator-confirmed hold, and straight-line retreat.
 
-`Controller Design for Autonomous Underwater Payload Retrieval with a Passive Tool and ROVs`
+The experiments support the thesis *Controller Design for Autonomous Underwater
+Payload Retrieval with a Passive Tool and ROVs*. The aim is to produce
+reproducible trials, event timelines, and quantitative results. Perception,
+autonomous hook detection, return-to-home, and docking are outside the current
+fixed-target experiment.
 
-The goal is to make each simulation or pool experiment reproducible, and to
-generate the tables, event timelines, and plots needed for the thesis
-Results / Analysis chapters.
+## Experiment Workflow
 
-## Data Required for Thesis Results
+Follow the complete [Glub procedure](FIXED_HOOK_POSE_VALIDATION_ZH.md) or
+[Splash procedure](SPLASH_FIXED_HOOK_ZH.md) for preflight checks, launch
+commands, operator permissions, and shutdown. The sequence is:
 
-Each complete trial should cover the task chain: payload detection, approach,
-line threading / hooking, return to the docking location, and handoff to the
-operator. Repeat each controller and each experimental condition multiple times.
+1. Manually engage the hook and record a stable raw MoCap target pose.
+2. Use A* and NMPC to reach the pre-approach point behind the target.
+3. After the robot-specific position, depth, and attitude gates pass, advance
+   along a horizontal straight line to the recorded pose.
+4. Hold in `WAIT_HOOK` until the operator visually confirms engagement and
+   presses `H`.
+5. Retreat along the same line to the pre-approach point and save the trial.
 
-Data that should be collected:
-
-- Robot state: position, attitude quaternion, linear velocity, and angular
-  velocity from PX4 odometry. In pool experiments with Qualisys / MoCap, also
-  record MoCap odometry.
-- Control inputs and outputs: `cmd_vel`, thrust setpoint, torque setpoint,
-  offboard / armed / control mode, and attitude setpoints if a controller
-  publishes them.
-- Perception results: handle pose, detection confidence, and whether the
-  detection is valid. RGB / depth raw images should preferably be saved in a
-  separate rosbag for qualitative figures and failure-case analysis.
-- Task geometry: payload pose, handle pose, dock pose, and tank bounds. In
-  simulation these can come from Gazebo ground truth; in the real pool they can
-  come from MoCap, calibration points, or manually measured metadata.
-- Task events: `start`, `first_detection`, `approach_start`, `hook_attempt`,
-  `hooked`, `return_start`, `docked`, `success`, or `failure`.
-- Experiment metadata: controller name, parameter file, environment, payload
-  mass / shape, hook version, camera calibration version, water / lighting
-  conditions, operator, and notes.
-
-These data support the following thesis metrics:
-
-- Task success rate, total duration, and per-stage duration.
-- Time to first detection, detection availability, and detection confidence
-  statistics.
-- Approach accuracy: minimum / final distance to the handle or payload.
-- Return accuracy: final docking error or distance to the handoff position.
-- Motion quality: path length, mean / RMS / maximum speed, and maximum angular
-  velocity.
-- Control cost: RMS, peak value, and time integral of normalized thrust /
-  torque.
-- Safety: minimum distance to tank bounds and number of out-of-bounds samples.
-
-When writing the thesis, report the mean, standard deviation, and median for
-each set of repeated experiments, and discuss failure cases separately.
-
-## Directory Structure
-
-- `config/trial_metadata_template.json`: metadata template to copy or edit
-  before each experiment.
-- `data/`: placeholder directory. By default, run logs are written to
-  `/home/yecheng/bluerov_ws/bluerov2_payload_retrieval_trials`.
-- `../../bluerov2_control/research/trial_data_logger.py`: ROS 2 CSV data
-  collection node.
-- `../../bluerov2_control/research/mark_trial_event.py`: command for manually
-  marking task events.
-- `../../bluerov2_control/research/analyze_trial.py`: offline analysis script.
-
-## Running Data Collection
-
-Build and source the workspace first:
+Build and source the workspace before running the data-collection tools. For
+real-robot builds, also follow the message-version and environment checks in
+the relevant operator guide.
 
 ```bash
 cd ~/bluerov_ws
@@ -72,21 +35,14 @@ colcon build --packages-select bluerov2_control
 source install/setup.bash
 ```
 
-## Recording a Fixed Hook Target in the Pool
+## Target Validation
 
-The current real-pool milestone is deliberately narrower than the complete
-retrieval mission: manually hook the target, record that stable pose from raw
-MoCap, then track a slow trajectory back to the recorded pose and hold it.
-
-Use the complete guarded procedure and terminal commands in
-[`FIXED_HOOK_POSE_VALIDATION_ZH.md`](FIXED_HOOK_POSE_VALIDATION_ZH.md).
-
-The target must be recorded directly from `/mocap/glub_fb/pose`, not from EKF
-odometry that can briefly coast through a raw MoCap dropout:
+Record Glub targets directly from `/mocap/glub/pose`, not from EKF odometry,
+which can briefly continue through a raw MoCap dropout:
 
 ```bash
 ros2 run bluerov2_control record_mocap_target_pose \
-  --topic /mocap/glub_fb/pose \
+  --topic /mocap/glub/pose \
   --message-type pose \
   --samples 160 \
   --timeout-sec 20 \
@@ -94,36 +50,73 @@ ros2 run bluerov2_control record_mocap_target_pose \
   --output-file /absolute/path/to/a/new_hooked_target.json
 ```
 
-Archived target JSON files that name `/mocap/glub/...` or
-`/mocap/glub_4/...` retain their original provenance and must not be
-relabelled. Record a new validated target after the rigid-body rename.
+Do not relabel files recorded under `/mocap/glub_fb/...`,
+`/mocap/glub_4/...`, or an earlier rigid-body definition. Keep their original
+provenance and record a new validated target from the current topic.
 
-## Automatic Fixed-Hook MPC Test
+Splash requires its own validated `/mocap/splash/pose` recording. Matching
+MAVLink IDs, dynamics presets, and nominal body-frame conventions do not make
+Glub's target quaternion valid for Splash. The only permitted derived target
+is the hash-locked
+`hooked_box_target_pose_splash_from_splash_fb_20260819_170318.json`
+manifest for the operator-confirmed rename of the same Splash rigid body.
+It is invalid if the marker definition, rigid-body origin or axes, mounting,
+or fixed hook pose changes; record a new target in that case.
 
-The real experiment uses a fail-closed launch. The current `glub_fb` target,
-NED/FRD frames, standard real-robot model, pool bounds, command limits, and
-target MAV IDs are stored as launch defaults, so the validated pipeline starts
-with one command:
+Never use
+`config/hooked_box_target_pose_splash_from_glub_20260802_195146.json`
+as an experiment input. It is an invalidated cross-robot transfer record.
+See the [Splash guide](SPLASH_FIXED_HOOK_ZH.md) for target validation and the
+robot-specific attitude gates.
+
+## Running a Fixed-Hook Trial
+
+The guarded real-robot launches use NED/FRD frames, the standard robot model,
+pool bounds, command limits, and target MAVLink IDs as defaults. Verify these
+against the physical setup before each deployment. Neither robot has a default
+target file. For Glub, set `TARGET_CFG` to a newly validated
+`/mocap/glub/pose` recording and pass it explicitly:
 
 ```bash
-ros2 launch bluerov2_control fixed_hook_pose_validation.launch.py
+ros2 launch bluerov2_control fixed_hook_pose_validation.launch.py \
+  target_config:="$TARGET_CFG"
 ```
 
-The guarded sequence is now pre-approach, straight final approach, a
-continuous five-second hold at the recorded pose, then a straight retreat to
-the pre-approach pose. MoCap remains the position/attitude source, while the
-MPC body-rate state is overridden by the low-latency BODY_FRD angular velocity
-from `/glub/fmu/out/vehicle_odometry`. The adapter withholds controller
-odometry if that PX4 rate is missing or stale.
+Use the dedicated launch in the [Splash guide](SPLASH_FIXED_HOOK_ZH.md) for
+Splash. Starting a launch does not arm the vehicle, request Offboard, or
+permit MPC motion; these are separate operator actions.
 
-`fixed_hook_mpc_june23.launch.py` remains only as a compatibility wrapper for
-this guarded launch. Do not run `stabilized_control_real.launch.py` or another
-Offboard/controller launch at the same time: they publish to the same heartbeat,
-thrust, and torque topics. Starting the fixed-hook launch does not arm the
-vehicle, request Offboard, or permit MPC motion. Those are separate operator
-actions documented in the Chinese procedure.
+During `WAIT_HOOK`, visually verify that the hook has engaged, then press `H`
+in a separate terminal running:
 
-Standard `/itrl_rov_1` simulation experiment:
+```bash
+source /home/yecheng/bluerov_ws/src/bluerov2_control/scripts/source_fixed_hook_real.bash
+ros2 run bluerov2_control confirm_hook_keyboard
+```
+
+`WAIT_HOOK` has no automatic timeout. Entry latches that the recorded hook-pose
+tolerances passed; later pose drift neither returns to `GO_FORWARD` nor
+invalidates confirmation. Wait at least `0.25 s` after the `WAIT_HOOK` entry
+log before pressing `H`. Confirmation starts `GO_BACK` only while mission,
+Armed/Offboard, odometry, solver, state, and command freshness remain healthy.
+The client calls `/bluerov2/fixed_hook/confirm_hook` once and exits. If the
+request is rejected, resolve the reported cause and run the client again.
+No timer starts retreat.
+
+Run only one controller stack at a time. Do not combine this launch with
+`stabilized_control_real.launch.py`, another Offboard controller, or the other
+robot's fixed-hook launch: they share command topics or operator permissions.
+`fixed_hook_mpc_june23.launch.py` is a compatibility wrapper for the guarded
+Glub launch.
+
+## Data Logging
+
+Use the logging instructions in the robot's operator guide for guarded
+fixed-hook trials. The generic launches below are for simulation and legacy
+experiments, not the current `/glub` fixed-hook control path. Do not run them
+alongside the guarded launch.
+
+For a standard `/itrl_rov_1` simulation experiment:
 
 ```bash
 ros2 launch bluerov2_control payload_retrieval_data_collection.launch.py \
@@ -132,9 +125,7 @@ ros2 launch bluerov2_control payload_retrieval_data_collection.launch.py \
   metadata_file:=/home/yecheng/bluerov_ws/src/bluerov2_control/experiments/payload_retrieval/config/trial_metadata_template.json
 ```
 
-The generic data-collection launch below is retained for legacy experiments;
-it is not the current `/glub` fixed-hook control path and must not be run in
-parallel with the guarded launch:
+For a legacy pool experiment:
 
 ```bash
 ros2 launch bluerov2_control payload_retrieval_data_collection.launch.py \
@@ -153,7 +144,9 @@ ros2 launch bluerov2_control payload_retrieval_data_collection.launch.py \
   control_mode_topic:=/fmu/out/vehicle_control_mode
 ```
 
-Mark key events from another terminal:
+Mark events from another terminal as they occur. The commands below show the
+broader retrieval event vocabulary; record only stages actually performed,
+and mark failures as well as successful outcomes.
 
 ```bash
 ros2 run bluerov2_control mark_trial_event start --note "mission started"
@@ -164,11 +157,34 @@ ros2 run bluerov2_control mark_trial_event docked
 ros2 run bluerov2_control mark_trial_event success
 ```
 
-Each run creates a trial directory containing:
+Logs are written by default to
+`/home/yecheng/bluerov_ws/bluerov2_payload_retrieval_trials`, not the local
+`data/` placeholder. Each trial directory contains:
 
 - `metadata.json`
 - `samples.csv`
 - `events.csv`
+
+Use [the metadata template](config/trial_metadata_template.json) to record the
+controller, parameter file, environment, payload mass and shape, hook version,
+calibration, lighting and water conditions, operator, and notes. Collect the
+following data where applicable:
+
+- Robot state: PX4 position, attitude, linear velocity, and angular velocity;
+  also record MoCap odometry in pool trials.
+- Control: `cmd_vel`, thrust and torque setpoints, armed/Offboard/control mode,
+  and attitude setpoints if published.
+- Geometry: payload, handle, and dock poses, plus tank bounds. Use simulation
+  ground truth or measured real-pool geometry, as appropriate.
+- Events: stage transitions, hook attempts, operator-confirmed engagement,
+  success, and failure, with notes that define the trial's outcome.
+- Perception, when tested: handle pose, confidence, and validity. Save raw RGB
+  and depth images in a separate rosbag for qualitative and failure analysis.
+
+The tools live in
+[`trial_data_logger.py`](../../bluerov2_control/research/trial_data_logger.py),
+[`mark_trial_event.py`](../../bluerov2_control/research/mark_trial_event.py), and
+[`analyze_trial.py`](../../bluerov2_control/research/analyze_trial.py).
 
 ## Offline Analysis
 
@@ -206,3 +222,36 @@ Analysis results are written to the trial directory under `analysis/`:
 - `thesis_results_summary.md`
 - If `matplotlib` is installed, plan-view, target-distance, and control plots
   are also generated.
+
+For repeated trials, compare task and stage duration, approach error, path
+length, speed, angular velocity, normalized thrust/torque cost, and distance
+to tank bounds. Include detection or docking metrics only when those stages
+were tested and the required data were recorded.
+
+Report the number of trials, the success criterion, and all failed or aborted
+runs. Summarize repeated measurements with mean, standard deviation, and
+median, and discuss failure cases separately. Reaching a pose or receiving
+operator confirmation alone does not establish an end-to-end retrieval
+success rate.
+
+## Scope and Safety Limits
+
+- The current experiment validates motion relative to a fixed recorded pose.
+  It does not detect the payload online, verify hook engagement automatically,
+  return home, or dock. The full detection-to-handoff mission remains a
+  broader research objective.
+- Pre-hook attitude alignment has no timeout by default. The robot waits for
+  the configured gates while path-safety and fail-closed checks remain active.
+  Splash's pre-hook gates differ from Glub's; both retain the recorded hook
+  quaternion as the reference and a `5 deg` final hook attitude gate.
+- In the current straight-line mode, ordinary yaw, lateral, or depth errors
+  do not freeze or rewind the reference. Endpoint completion still requires
+  measured position, depth, and attitude tolerances. Command limits, operating
+  bounds, state continuity, and failure checks remain active.
+- MoCap supplies position and attitude; PX4 supplies the BODY_FRD angular
+  velocity used by MPC. Missing or stale PX4 rates prevent the adapter from
+  publishing controller odometry.
+- Simulation coordinates and bounds are not real-pool measurements. Verify
+  frames, target provenance, bounds, message versions, and vehicle IDs using
+  the [Glub](FIXED_HOOK_POSE_VALIDATION_ZH.md) or
+  [Splash](SPLASH_FIXED_HOOK_ZH.md) procedure before operating the robot.

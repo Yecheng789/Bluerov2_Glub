@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from launch import LaunchContext
+from launch.actions import LogInfo
+from launch.utilities import perform_substitutions
 from launch_ros.actions import Node as LaunchNode
+from launch_ros.utilities import evaluate_parameters
 from std_msgs.msg import Bool
 
 from bluerov2_control.calibrate_mocap_orientation_correction import (
@@ -132,6 +135,31 @@ def _validated_recording_payload(recorder_age_limit=0.20):
     }
 
 
+def _write_current_glub_target(tmp_path):
+    payload = _validated_recording_payload()
+    payload.update({
+        'frame_id': 'mocap',
+        'message_type': 'geometry_msgs/PoseStamped',
+        'source_topic': '/mocap/glub/pose',
+        'target_pose': {
+            'position': {
+                'x': 4.3595638641,
+                'y': -0.0429188150,
+                'z': 1.7280517059,
+            },
+            'orientation_xyzw': {
+                'x': 0.0314056173,
+                'y': -0.0385181277,
+                'z': 0.9914992558,
+                'w': -0.1202466915,
+            },
+        },
+    })
+    target_path = tmp_path / 'current_glub_target.json'
+    target_path.write_text(json.dumps(payload), encoding='utf-8')
+    return target_path
+
+
 def test_target_and_live_mocap_age_limits_must_match():
     module = _load_launch_module()
     context = _recording_validation_context()
@@ -149,14 +177,14 @@ def test_target_and_live_mocap_age_limits_must_match():
 @pytest.mark.parametrize(
     ('source_topic', 'expected_error'),
     [
-        ('/mocap/glub_fb/pose', None),
+        ('/mocap/glub/pose', None),
         (
-            '/mocap/glub_4/pose',
-            'target source_topic must be /mocap/glub_fb/pose',
+            '/mocap/glub_fb/pose',
+            'target source_topic must be /mocap/glub/pose',
         ),
         (
-            '/mocap/glub/pose',
-            'target source_topic must be /mocap/glub_fb/pose',
+            '/mocap/glub_4/pose',
+            'target source_topic must be /mocap/glub/pose',
         ),
     ],
 )
@@ -186,10 +214,12 @@ def test_fixed_hook_launch_accepts_only_current_rigid_body_target(
     for entity in module.generate_launch_description().entities:
         if getattr(entity, 'name', None) is not None:
             entity.execute(context)
-    assert context.launch_configurations['rigid_body_name'] == 'glub_fb'
+    assert context.launch_configurations['rigid_body_name'] == 'glub'
     assert context.launch_configurations['robot_namespace'] == '/glub'
-    assert context.launch_configurations['target_config'].endswith(
-        'hooked_box_target_pose_20260802_195146.json'
+    assert context.launch_configurations['target_config'] == 'unconfigured'
+    assert (
+        context.launch_configurations['allow_identity_derived_target']
+        == 'false'
     )
     assert context.launch_configurations['mocap_world_frame'] == 'ned'
     assert (
@@ -209,6 +239,69 @@ def test_fixed_hook_launch_accepts_only_current_rigid_body_target(
     assert context.launch_configurations['pre_approach_speed_mps'] == '0.06'
     assert context.launch_configurations['final_approach_speed_mps'] == '0.09'
     assert context.launch_configurations['min_traj_duration_s'] == '5.0'
+    assert context.launch_configurations['prehook_planner_check_rate_hz'] == '2.0'
+    assert context.launch_configurations['prehook_replan_deviation_m'] == '0.30'
+    assert context.launch_configurations['prehook_reached_hold_s'] == '1.0'
+    assert (
+        context.launch_configurations['prehook_attitude_reference_mode']
+        == 'recorded_hook'
+    )
+    assert (
+        context.launch_configurations[
+            'prehook_reached_orientation_tol_deg'
+        ]
+        == '5.0'
+    )
+    assert (
+        context.launch_configurations['prehook_reached_yaw_tol_deg']
+        == '3.0'
+    )
+    assert (
+        context.launch_configurations['fixed_hook_line_yaw_tol_deg']
+        == '3.0'
+    )
+    assert (
+        context.launch_configurations['fixed_hook_line_position_mode']
+        == 'true'
+    )
+    assert (
+        context.launch_configurations['fixed_hook_line_cross_track_tol_m']
+        == '0.03'
+    )
+    assert (
+        context.launch_configurations['fixed_hook_line_max_reference_lead_m']
+        == '0.02'
+    )
+    assert (
+        context.launch_configurations[
+            'fixed_hook_line_interlock_release_ratio'
+        ]
+        == '0.8'
+    )
+    assert (
+        context.launch_configurations[
+            'fixed_hook_line_velocity_weight_multiplier'
+        ]
+        == '20.0'
+    )
+    assert (
+        context.launch_configurations[
+            'prehook_attitude_wait_exit_hysteresis_ratio'
+        ]
+        == '1.5'
+    )
+    assert (
+        context.launch_configurations[
+            'prehook_attitude_alignment_timeout_s'
+        ]
+        == '0.0'
+    )
+    assert context.launch_configurations['prehook_astar_resolution_m'] == '0.10'
+    assert context.launch_configurations['prehook_robot_radius_m'] == '0.20'
+    assert (
+        context.launch_configurations['prehook_static_obstacles_ned_xyxy']
+        == ''
+    )
     assert context.launch_configurations['traj_angular_speed_deg_s'] == '8.0'
     assert context.launch_configurations['final_pose_hold_s'] == '5.0'
     assert context.launch_configurations['retreat_speed_mps'] == '0.09'
@@ -263,6 +356,210 @@ def test_fixed_hook_launch_accepts_only_current_rigid_body_target(
     actions = module._launch_setup(context)
     nodes = [action for action in actions if isinstance(action, LaunchNode)]
     assert len(nodes) == 5
+    mpc_node = next(
+        node
+        for node in nodes
+        if vars(node)['_Node__node_executable']
+        == 'mpc_track_trajectory_acados'
+    )
+    mpc_parameters = evaluate_parameters(
+        context,
+        vars(mpc_node)['_Node__parameters'],
+    )[0]
+    assert mpc_parameters['require_operator_hook_confirmation'] is True
+    assert mpc_parameters['hook_confirmation_service'] == (
+        '/bluerov2/fixed_hook/confirm_hook'
+    )
+    assert mpc_parameters['hook_confirmation_min_wait_s'] == pytest.approx(
+        0.25
+    )
+    assert mpc_parameters['prehook_attitude_reference_mode'] == (
+        'recorded_hook'
+    )
+    assert mpc_parameters[
+        'prehook_reached_orientation_tol_rad'
+    ] == pytest.approx(np.deg2rad(5.0))
+    assert mpc_parameters[
+        'prehook_reached_forward_axis_tol_rad'
+    ] == pytest.approx(np.deg2rad(5.0))
+    assert mpc_parameters['prehook_reached_yaw_tol_rad'] == pytest.approx(
+        np.deg2rad(3.0)
+    )
+    assert mpc_parameters['fixed_hook_line_yaw_tol_rad'] == pytest.approx(
+        np.deg2rad(3.0)
+    )
+    assert mpc_parameters['fixed_hook_line_position_mode'] is True
+    assert mpc_parameters[
+        'fixed_hook_line_cross_track_tol_m'
+    ] == pytest.approx(0.03)
+    assert mpc_parameters[
+        'fixed_hook_line_max_reference_lead_m'
+    ] == pytest.approx(0.02)
+    assert mpc_parameters[
+        'fixed_hook_line_interlock_release_ratio'
+    ] == pytest.approx(0.8)
+    assert mpc_parameters[
+        'fixed_hook_line_velocity_weight_multiplier'
+    ] == pytest.approx(20.0)
+    assert mpc_parameters[
+        'prehook_attitude_wait_exit_hysteresis_ratio'
+    ] == pytest.approx(1.5)
+    mocap_node = next(
+        node
+        for node in nodes
+        if vars(node)['_Node__node_executable'] == 'mocap_ekf_odom'
+    )
+    mocap_parameters = evaluate_parameters(
+        context,
+        vars(mocap_node)['_Node__parameters'],
+    )[0]
+    assert mocap_parameters['rigid_body_name'] == 'glub'
+    assert mocap_parameters['pose_topic'] == '/mocap/glub/pose'
+    assert mocap_parameters['odom_topic'] == (
+        '/mocap/glub/odom_ekf_fixed_hook'
+    )
+    assert mocap_parameters['child_frame'] == 'glub/body_ekf_frd'
+    assert mocap_parameters['max_rejected_samples'] == 0
+    assert mocap_parameters[
+        'max_base_link_z_axis_angle_rad'
+    ] == pytest.approx(0.55)
+    adapter_node = next(
+        node
+        for node in nodes
+        if vars(node)['_Node__node_executable']
+        == 'nav_odom_to_vehicle_odometry'
+    )
+    adapter_parameters = evaluate_parameters(
+        context,
+        vars(adapter_node)['_Node__parameters'],
+    )[0]
+    assert adapter_parameters['input_odom_topic'] == (
+        '/mocap/glub/odom_ekf_fixed_hook'
+    )
+    assert adapter_parameters['output_vehicle_odometry_topic'] == (
+        '/mocap/glub/vehicle_odometry_fixed_hook'
+    )
+    logger_node = next(
+        node
+        for node in nodes
+        if vars(node)['_Node__node_executable']
+        == 'payload_retrieval_data_logger'
+    )
+    logger_parameters = evaluate_parameters(
+        context,
+        vars(logger_node)['_Node__parameters'],
+    )[0]
+    assert logger_parameters['raw_mocap_pose_topic'] == (
+        '/mocap/glub/pose'
+    )
+    notes = json.loads(logger_parameters['notes'])
+    assert notes['prehook_planner']['attitude_reference_mode'] == (
+        'recorded_hook'
+    )
+    assert notes['prehook_planner'][
+        'reached_orientation_tolerance_deg'
+    ] == pytest.approx(5.0)
+    assert notes['prehook_planner'][
+        'reached_yaw_tolerance_deg'
+    ] == pytest.approx(3.0)
+    assert notes['prehook_planner'][
+        'attitude_wait_exit_hysteresis_ratio'
+    ] == pytest.approx(1.5)
+    assert notes['prehook_planner'][
+        'attitude_alignment_timeout_s'
+    ] == pytest.approx(0.0)
+    assert notes['prehook_planner'][
+        'attitude_alignment_timeout_enabled'
+    ] is False
+    assert notes['prehook_planner']['attitude_timeout_action'] == (
+        'continuous_nmpc_alignment_no_elapsed_timeout'
+    )
+    assert notes['prehook_planner'][
+        'attitude_timeout_integral_semantics'
+    ] == 'not_applicable_no_timeout_transition'
+    assert notes['operator_hook_confirmation'] == {
+        'required': True,
+        'input': 'dedicated_terminal_h_key',
+        'service': '/bluerov2/fixed_hook/confirm_hook',
+        'accepted_state': 'WAIT_HOOK',
+        'next_state': 'GO_BACK',
+        'automatic_timeout_s': None,
+        'minimum_wait_after_state_entry_s': 0.25,
+        'reject_if_pose_outside_tolerance': False,
+        'arrival_pose_latched_on_wait_entry': True,
+    }
+    assert notes['final_pose_hold_s_scope'] == (
+        'legacy_final_hold_only_not_dynamic_wait_hook'
+    )
+    assert notes['fixed_hook_line_interlock'] == {
+        'enabled': False,
+        'control_mode': 'position_like_time_parameterized_ned',
+        'active_states': [],
+        'progress_source': 'monotonic_trajectory_time',
+        'progress_semantics': 'direct_to_endpoint_no_freeze_no_rewind',
+        'yaw_tolerance_deg': 3.0,
+        'cross_track_tolerance_m': 0.03,
+        'depth_tolerance_m': 0.03,
+        'maximum_reference_lead_m': None,
+        'maximum_reference_lead_semantics': (
+            'not_used_by_time_parameterized_position_mode'
+        ),
+        'release_ratio': 0.8,
+        'velocity_weight_multiplier': 20.0,
+        'velocity_weight_scope': 'GO_FORWARD_GO_BACK_world_ned_velocity',
+        'velocity_reference_frame': 'ned',
+        'depth_velocity_reference_mps': 0.0,
+        'interlocked_velocity_weight_multiplier': None,
+        'interlocked_velocity_weight_semantics': (
+            'not_applicable_interlock_disabled'
+        ),
+        'outside_tolerance_action': (
+            'continue_translation_and_correct_all_axes_with_nmpc'
+        ),
+        'backslide_action': (
+            'time_reference_continues_toward_endpoint_never_rewinds'
+        ),
+        'cross_track_integral_semantics': (
+            'bounded_line_normal_only_during_transit'
+        ),
+        'depth_integral_semantics': (
+            'bounded_world_z_updated_during_transit'
+        ),
+        'along_track_integral_semantics': (
+            'always_zero_during_transit'
+        ),
+        'reference_depth': 'recorded_hook_depth',
+    }
+    launch_messages = [
+        perform_substitutions(
+            context,
+            vars(action)['_LogInfo__msg'],
+        )
+        for action in actions
+        if isinstance(action, LogInfo)
+    ]
+    assert any(
+        'WAIT_HOOK(operator H confirmation, no automatic timeout)'
+        in message
+        and 'straight GO_BACK' in message
+        for message in launch_messages
+    )
+    assert any(
+        'attitude reference=recorded_hook' in message
+        and 'pre-hook attitude tolerance=5.0deg' in message
+        and 'pre-hook yaw tolerance=3.0deg' in message
+        and 'position/depth wait-exit hysteresis=1.50x' in message
+        for message in launch_messages
+    )
+    assert any(
+        'Fixed-hook Position-like translation' in message
+        and 'monotonic time-parameterized horizontal NED' in message
+        and 'does not freeze, brake, or rewind' in message
+        and 'NED depth and depth-velocity references stay constant' in message
+        and '20.0x world-velocity weight' in message
+        and 'acceptance gates remain active' in message
+        for message in launch_messages
+    )
 
 
 def test_fixed_hook_compatibility_wrapper_uses_current_real_defaults():
@@ -278,11 +575,10 @@ def test_fixed_hook_compatibility_wrapper_uses_current_real_defaults():
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
-    assert module.DEFAULTS['rigid_body_name'] == 'glub_fb'
+    assert module.DEFAULTS['rigid_body_name'] == 'glub'
     assert module.DEFAULTS['robot_namespace'] == '/glub'
-    assert module.DEFAULTS['target_config'].endswith(
-        'hooked_box_target_pose_20260802_195146.json'
-    )
+    assert module.DEFAULTS['target_config'] == 'unconfigured'
+    assert module.DEFAULTS['allow_identity_derived_target'] == 'false'
     assert module.DEFAULTS['mocap_world_frame'] == 'ned'
     assert module.DEFAULTS['mocap_body_frame'] == 'frd'
     assert module.DEFAULTS['robot_type'] == 'standard'
@@ -295,6 +591,31 @@ def test_fixed_hook_compatibility_wrapper_uses_current_real_defaults():
     assert module.DEFAULTS['pre_approach_speed_mps'] == '0.06'
     assert module.DEFAULTS['final_approach_speed_mps'] == '0.09'
     assert module.DEFAULTS['min_traj_duration_s'] == '5.0'
+    assert module.DEFAULTS['prehook_planner_check_rate_hz'] == '2.0'
+    assert module.DEFAULTS['prehook_replan_deviation_m'] == '0.30'
+    assert module.DEFAULTS['prehook_reached_hold_s'] == '1.0'
+    assert module.DEFAULTS['prehook_attitude_reference_mode'] == (
+        'recorded_hook'
+    )
+    assert module.DEFAULTS['prehook_reached_orientation_tol_deg'] == '5.0'
+    assert module.DEFAULTS['prehook_reached_yaw_tol_deg'] == '3.0'
+    assert module.DEFAULTS['fixed_hook_line_yaw_tol_deg'] == '3.0'
+    assert module.DEFAULTS['fixed_hook_line_cross_track_tol_m'] == '0.03'
+    assert module.DEFAULTS['fixed_hook_line_max_reference_lead_m'] == '0.02'
+    assert module.DEFAULTS[
+        'fixed_hook_line_interlock_release_ratio'
+    ] == '0.8'
+    assert (
+        module.DEFAULTS['fixed_hook_line_velocity_weight_multiplier']
+        == '20.0'
+    )
+    assert module.DEFAULTS[
+        'prehook_attitude_wait_exit_hysteresis_ratio'
+    ] == '1.5'
+    assert module.DEFAULTS['prehook_attitude_alignment_timeout_s'] == '0.0'
+    assert module.DEFAULTS['prehook_astar_resolution_m'] == '0.10'
+    assert module.DEFAULTS['prehook_robot_radius_m'] == '0.20'
+    assert module.DEFAULTS['prehook_static_obstacles_ned_xyxy'] == ''
     assert module.DEFAULTS['traj_angular_speed_deg_s'] == '8.0'
     assert module.DEFAULTS['final_pose_hold_s'] == '5.0'
     assert module.DEFAULTS['retreat_speed_mps'] == '0.09'
@@ -316,7 +637,45 @@ def test_fixed_hook_compatibility_wrapper_uses_current_real_defaults():
     assert module.DEFAULTS['max_mocap_coast_sec'] == '2.0'
     assert module.DEFAULTS['max_initial_goal_distance_m'] == '0'
     assert module.DEFAULTS['max_initial_goal_orientation_error_deg'] == '0'
+    assert module.DEFAULTS['target_min_samples'] == '80'
+    assert module.DEFAULTS['target_min_sampling_span_sec'] == '0.75'
+    assert module.DEFAULTS['target_max_position_std_m'] == '0.015'
+    assert module.DEFAULTS['target_max_orientation_std_deg'] == '1.5'
+    assert module.DEFAULTS['target_max_orientation_spread_deg'] == '5.0'
+    assert 'allow_identity_derived_target' in module.FORWARDED_ARGUMENTS
     assert 'pre_approach_distance_m' in module.FORWARDED_ARGUMENTS
+    assert 'prehook_planner_check_rate_hz' in module.FORWARDED_ARGUMENTS
+    assert 'prehook_replan_deviation_m' in module.FORWARDED_ARGUMENTS
+    assert 'prehook_reached_hold_s' in module.FORWARDED_ARGUMENTS
+    assert 'prehook_attitude_reference_mode' in module.FORWARDED_ARGUMENTS
+    assert (
+        'prehook_reached_orientation_tol_deg'
+        in module.FORWARDED_ARGUMENTS
+    )
+    assert 'prehook_reached_yaw_tol_deg' in module.FORWARDED_ARGUMENTS
+    assert 'fixed_hook_line_yaw_tol_deg' in module.FORWARDED_ARGUMENTS
+    assert 'fixed_hook_line_cross_track_tol_m' in module.FORWARDED_ARGUMENTS
+    assert (
+        'fixed_hook_line_max_reference_lead_m'
+        in module.FORWARDED_ARGUMENTS
+    )
+    assert (
+        'fixed_hook_line_interlock_release_ratio'
+        in module.FORWARDED_ARGUMENTS
+    )
+    assert (
+        'fixed_hook_line_velocity_weight_multiplier'
+        in module.FORWARDED_ARGUMENTS
+    )
+    assert (
+        'prehook_attitude_wait_exit_hysteresis_ratio'
+        in module.FORWARDED_ARGUMENTS
+    )
+    assert (
+        'prehook_attitude_alignment_timeout_s'
+        in module.FORWARDED_ARGUMENTS
+    )
+    assert 'prehook_static_obstacles_ned_xyxy' in module.FORWARDED_ARGUMENTS
     assert 'fixed_hook_depth_tolerance_m' in module.FORWARDED_ARGUMENTS
     assert 'pre_approach_speed_mps' in module.FORWARDED_ARGUMENTS
     assert 'final_approach_speed_mps' in module.FORWARDED_ARGUMENTS
@@ -337,6 +696,162 @@ def test_fixed_hook_compatibility_wrapper_uses_current_real_defaults():
         in module.FORWARDED_ARGUMENTS
     )
     assert 'max_mocap_coast_sec' in module.FORWARDED_ARGUMENTS
+    assert 'target_min_samples' in module.FORWARDED_ARGUMENTS
+    assert 'target_min_sampling_span_sec' in module.FORWARDED_ARGUMENTS
+    assert 'target_max_position_std_m' in module.FORWARDED_ARGUMENTS
+    assert 'target_max_orientation_std_deg' in module.FORWARDED_ARGUMENTS
+    assert 'target_max_orientation_spread_deg' in module.FORWARDED_ARGUMENTS
+
+
+@pytest.mark.parametrize(
+    ('name', 'value', 'error'),
+    [
+        (
+            'prehook_attitude_reference_mode',
+            'unknown',
+            'choose one of: capture_start_trim, recorded_hook',
+        ),
+        (
+            'prehook_reached_orientation_tol_deg',
+            '0.9',
+            'must be >= 1.0',
+        ),
+        (
+            'prehook_reached_orientation_tol_deg',
+            '20.1',
+            'must be <= 20.0',
+        ),
+        (
+            'prehook_reached_forward_axis_tol_deg',
+            '0.4',
+            'must be >= 0.5',
+        ),
+        (
+            'prehook_reached_forward_axis_tol_deg',
+            '20.1',
+            'must be <= 20.0',
+        ),
+        (
+            'prehook_attitude_wait_exit_hysteresis_ratio',
+            '0.9',
+            'must be >= 1.0',
+        ),
+        (
+            'prehook_attitude_wait_exit_hysteresis_ratio',
+            '3.1',
+            'must be <= 3.0',
+        ),
+    ],
+)
+def test_prehook_attitude_launch_arguments_fail_closed(name, value, error):
+    module = _load_launch_module()
+    context = LaunchContext()
+    context.launch_configurations[name] = value
+    if name == 'prehook_attitude_reference_mode':
+        with pytest.raises(RuntimeError, match=error):
+            module._parse_choice(
+                context,
+                name,
+                {'recorded_hook', 'capture_start_trim'},
+            )
+    else:
+        if name == 'prehook_reached_orientation_tol_deg':
+            minimum, maximum = 1.0, 20.0
+        elif name == 'prehook_reached_forward_axis_tol_deg':
+            minimum, maximum = 0.5, 20.0
+        else:
+            minimum, maximum = 1.0, 3.0
+        with pytest.raises(RuntimeError, match=error):
+            module._parse_float(
+                context,
+                name,
+                minimum=minimum,
+                maximum=maximum,
+            )
+
+
+@pytest.mark.parametrize(
+    ('value', 'expected', 'error'),
+    [
+        ('0', 0.0, None),
+        ('5', 5.0, None),
+        ('-1', None, 'must be >= 0.0'),
+        ('1', None, r'must be 0 \(disabled\) or >= 5.0'),
+        ('121', None, 'must be <= 120.0'),
+    ],
+)
+def test_optional_attitude_timeout_parser(value, expected, error):
+    module = _load_launch_module()
+    context = LaunchContext()
+    context.launch_configurations[
+        'prehook_attitude_alignment_timeout_s'
+    ] = value
+
+    if error is not None:
+        with pytest.raises(RuntimeError, match=error):
+            module._parse_optional_timeout(
+                context,
+                'prehook_attitude_alignment_timeout_s',
+            )
+        return
+
+    assert module._parse_optional_timeout(
+        context,
+        'prehook_attitude_alignment_timeout_s',
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ('name', 'value', 'minimum', 'maximum', 'error'),
+    [
+        (
+            'prehook_reached_yaw_tol_deg',
+            '0.4',
+            0.5,
+            20.0,
+            'must be >= 0.5',
+        ),
+        (
+            'fixed_hook_line_yaw_tol_deg',
+            '20.1',
+            0.5,
+            20.0,
+            'must be <= 20.0',
+        ),
+        (
+            'fixed_hook_line_cross_track_tol_m',
+            '0.004',
+            0.005,
+            0.20,
+            'must be >= 0.005',
+        ),
+        (
+            'fixed_hook_line_max_reference_lead_m',
+            '0.201',
+            0.005,
+            0.20,
+            'must be <= 0.2',
+        ),
+    ],
+)
+def test_fixed_hook_line_interlock_launch_arguments_fail_closed(
+    name,
+    value,
+    minimum,
+    maximum,
+    error,
+):
+    module = _load_launch_module()
+    context = LaunchContext()
+    context.launch_configurations[name] = value
+
+    with pytest.raises(RuntimeError, match=error):
+        module._parse_float(
+            context,
+            name,
+            minimum=minimum,
+            maximum=maximum,
+        )
 
 
 def test_new_recorded_target_builds_half_metre_body_forward_pre_hook():
@@ -412,7 +927,7 @@ def test_launch_rejects_pre_approach_waypoint_outside_pool(tmp_path):
     payload.update({
         'frame_id': 'mocap',
         'message_type': 'geometry_msgs/PoseStamped',
-        'source_topic': '/mocap/glub_fb/pose',
+        'source_topic': '/mocap/glub/pose',
         'target_pose': {
             # The target is inside the 0.25 m shrunken pool, but the 0.50 m
             # zero-yaw pre-hook point lies outside the minimum X boundary.
@@ -437,6 +952,51 @@ def test_launch_rejects_pre_approach_waypoint_outside_pool(tmp_path):
     with pytest.raises(
         RuntimeError,
         match='converted pre-approach position.*outside',
+    ):
+        module._launch_setup(context)
+
+
+def test_launch_rejects_wall_margin_smaller_than_collision_envelope(tmp_path):
+    module = _load_launch_module()
+    context = LaunchContext()
+    for entity in module.generate_launch_description().entities:
+        if getattr(entity, 'name', None) is not None:
+            entity.execute(context)
+    context.launch_configurations.update({
+        'target_config': str(_write_current_glub_target(tmp_path)),
+        'prehook_robot_radius_m': '0.30',
+        'prehook_obstacle_margin_m': '0.05',
+        'pool_safety_margin_m': '0.25',
+    })
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            'pool_safety_margin_m must be at least '
+            'prehook_robot_radius_m'
+        ),
+    ):
+        module._launch_setup(context)
+
+
+def test_launch_rejects_obstacle_crossing_fixed_hook_corridor(tmp_path):
+    module = _load_launch_module()
+    context = LaunchContext()
+    for entity in module.generate_launch_description().entities:
+        if getattr(entity, 'name', None) is not None:
+            entity.execute(context)
+    context.launch_configurations.update({
+        'target_config': str(_write_current_glub_target(tmp_path)),
+        'prehook_robot_radius_m': '0.05',
+        'prehook_obstacle_margin_m': '0.0',
+        # This small rectangle crosses the middle of the configured 0.50 m
+        # pre-hook-to-hook line while neither endpoint lies inside it.
+        'prehook_static_obstacles_ned_xyxy': '4.59 4.61 0.01 0.03',
+    })
+
+    with pytest.raises(
+        RuntimeError,
+        match='GO_FORWARD/GO_BACK corridor intersects',
     ):
         module._launch_setup(context)
 
@@ -566,6 +1126,105 @@ def test_valid_out_of_bounds_odom_zeroes_and_latches_mission_preflight():
     ]
     assert any('outside the configured operating bounds' in message
                for _level, message in logger.messages)
+
+
+def test_odom_jump_never_replaces_the_last_trusted_snapshot():
+    logger = _Logger()
+    invalidations = []
+    parameters = {
+        'require_expected_odom_frames': False,
+        'min_odom_quality': 0,
+        'require_increasing_odom_timestamp': True,
+        'max_tilt_rad': 0.55,
+        'require_mission_enable': True,
+        'max_odom_position_jump_m': 0.20,
+        'max_odom_orientation_jump_rad': float(np.deg2rad(20.0)),
+    }
+    trusted_position = np.array([4.0, -0.2, 1.4], dtype=float)
+    trusted_quaternion = (1.0, 0.0, 0.0, 0.0)
+    trusted_velocity = np.array([0.01, 0.02, 0.03], dtype=float)
+    trusted_rate = np.array([0.04, 0.05, 0.06], dtype=float)
+    fake = SimpleNamespace(
+        operating_bounds_enabled=False,
+        operating_bounds_min_ned=np.array([0.0, -2.5, 0.0]),
+        operating_bounds_max_ned=np.array([9.0, 2.5, 3.0]),
+        have_odom=True,
+        odom_valid=True,
+        mission_enable=True,
+        mission_rearm_required=False,
+        last_odom_timestamp_sample=100,
+        last_odom_sec=12.5,
+        p_w=trusted_position.copy(),
+        q_wxyz=trusted_quaternion,
+        v_b=trusted_velocity.copy(),
+        w_b=trusted_rate.copy(),
+        last_valid_position=trusted_position.copy(),
+        last_valid_quat_wxyz=trusted_quaternion,
+        get_parameter=lambda name: SimpleNamespace(value=parameters[name]),
+        get_logger=lambda: logger,
+        _now_sec=lambda: 99.0,
+        _invalidate_command=lambda **kwargs: invalidations.append(kwargs),
+    )
+    fake._revoke_mission_enable = lambda reason: (
+        MPCTrackTrajectoryAcados._revoke_mission_enable(fake, reason)
+    )
+    fake._reject_odom = lambda reason, **kwargs: (
+        MPCTrackTrajectoryAcados._reject_odom(fake, reason, **kwargs)
+    )
+
+    candidate = VehicleOdometry()
+    candidate.timestamp_sample = 101
+    candidate.position = [4.52, -0.2, 1.4]
+    jump_yaw_rad = 2.582
+    candidate.q = [
+        np.cos(jump_yaw_rad / 2.0),
+        0.0,
+        0.0,
+        np.sin(jump_yaw_rad / 2.0),
+    ]
+    candidate.velocity = [9.0, 8.0, 7.0]
+    candidate.angular_velocity = [6.0, 5.0, 4.0]
+
+    MPCTrackTrajectoryAcados.on_odom(fake, candidate)
+
+    assert fake.mission_enable is False
+    assert fake.mission_rearm_required is True
+    assert fake.have_odom is True
+    assert fake.odom_valid is True
+    assert fake.last_odom_timestamp_sample == 100
+    assert fake.last_odom_sec == pytest.approx(12.5)
+    np.testing.assert_allclose(fake.p_w, trusted_position)
+    np.testing.assert_allclose(fake.q_wxyz, trusted_quaternion)
+    np.testing.assert_allclose(fake.v_b, trusted_velocity)
+    np.testing.assert_allclose(fake.w_b, trusted_rate)
+    np.testing.assert_allclose(fake.last_valid_position, trusted_position)
+    np.testing.assert_allclose(
+        fake.last_valid_quat_wxyz,
+        trusted_quaternion,
+    )
+    assert invalidations == [
+        {'reset_trajectory': True, 'publish_zero': True}
+    ]
+
+    # The first rejection latched mission_enable false.  A later bad sample
+    # must still be compared with the trusted anchor, not silently committed.
+    candidate.timestamp_sample = 102
+    candidate.position = [4.60, -0.2, 1.4]
+    MPCTrackTrajectoryAcados.on_odom(fake, candidate)
+
+    assert fake.last_odom_timestamp_sample == 100
+    assert fake.last_odom_sec == pytest.approx(12.5)
+    np.testing.assert_allclose(fake.p_w, trusted_position)
+    np.testing.assert_allclose(fake.last_valid_position, trusted_position)
+    assert invalidations == [
+        {'reset_trajectory': True, 'publish_zero': True}
+    ]
+    assert fake.mission_rearm_required is True
+    assert sum(
+        'Odometry jump detected' in message
+        for level, message in logger.messages
+        if level == 'error'
+    ) == 2
 
 
 def test_orientation_calibration_rejects_invalid_quaternions():
@@ -732,9 +1391,12 @@ def test_terminal_hold_requires_attitude_when_hold_attitude_is_enabled():
     terminal_reference = MPCTrackTrajectoryAcados._trajectory_stage_param(
         fake, 0
     )
+    assert terminal_reference.shape == (12,)
     np.testing.assert_allclose(terminal_reference[0:3], goal_position)
     np.testing.assert_allclose(terminal_reference[3:7], goal_quaternion)
     assert terminal_reference[7] == pytest.approx(1.0)
+    np.testing.assert_allclose(terminal_reference[8:11], np.zeros(3))
+    assert terminal_reference[11] == pytest.approx(1.0)
 
 
 def test_fixed_hook_holds_five_seconds_then_retreats_to_pre_approach():
@@ -744,6 +1406,7 @@ def test_fixed_hook_holds_five_seconds_then_retreats_to_pre_approach():
     terminal_holds = []
     parameters = {
         'use_box_recovery_mission': False,
+        'fixed_hook_line_position_mode': False,
         'final_pose_hold_s': 5.0,
         'return_to_pre_approach_after_hold': True,
     }
@@ -926,8 +1589,10 @@ def test_position_integral_removes_steady_error_after_reference_finishes():
     )
 
 
-def test_fixed_hook_transit_freezes_only_learned_world_z_bias():
+def test_fixed_hook_transit_retains_line_normal_and_world_z_bias():
     fake = _position_integral_fake(position_error_z_m=-0.03)
+    fake.traj_start_pos = np.array([0.0, 0.0, 0.03])
+    fake.traj_goal_pos = np.array([1.0, 0.0, 0.03])
     fake.position_integral_error_world[:] = [0.4, -0.2, -1.0]
     fake.last_position_integral_update_sec = 8.0
     fake._fixed_hook_transit_active = lambda: True
@@ -939,12 +1604,12 @@ def test_fixed_hook_transit_freezes_only_learned_world_z_bias():
         9.0,
     )
 
-    np.testing.assert_allclose(force, [1.0, 2.0, -5.0])
+    np.testing.assert_allclose(force, [1.0, 1.4, -5.0])
     np.testing.assert_allclose(
         fake.position_integral_error_world,
-        [0.0, 0.0, -1.0],
+        [0.0, -0.2, -1.0],
     )
-    assert fake.last_position_integral_update_sec is None
+    assert fake.last_position_integral_update_sec == pytest.approx(9.0)
 
 
 def test_position_integral_combined_force_never_exceeds_thrust_limit():
@@ -1118,6 +1783,7 @@ def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
     )
     parameters = {
         'use_box_recovery_mission': False,
+        'fixed_hook_line_position_mode': False,
         'traj_angular_speed_rad_s': np.deg2rad(8.0),
         'min_traj_duration_s': 5.0,
         'Ts': 0.04,
@@ -1157,6 +1823,9 @@ def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
     fake._fixed_hook_line_segment = lambda: (
         MPCTrackTrajectoryAcados._fixed_hook_line_segment(fake)
     )
+    fake._fixed_hook_line_governor_active = lambda: (
+        MPCTrackTrajectoryAcados._fixed_hook_line_governor_active(fake)
+    )
 
     def build_and_sample(goal):
         fake.now_sec = 100.0
@@ -1173,9 +1842,16 @@ def test_fixed_hook_forward_and_retreat_share_level_pose_locked_path():
     forward_duration, forward = build_and_sample(hook)
     np.testing.assert_allclose(fake.traj_start_pos, pre_approach)
     np.testing.assert_allclose(fake.traj_goal_pos, hook)
+    line_unit_xy = (hook - pre_approach)[0:2]
+    line_unit_xy /= np.linalg.norm(line_unit_xy)
+    line_normal_xy = np.array([-line_unit_xy[1], line_unit_xy[0]])
+    expected_integral_xy = (
+        np.dot(np.array([0.3, -0.2]), line_normal_xy)
+        * line_normal_xy
+    )
     np.testing.assert_allclose(
         fake.position_integral_error_world,
-        [0.0, 0.0, -1.0],
+        [expected_integral_xy[0], expected_integral_xy[1], -1.0],
     )
 
     fake.mission_state = 'RETREAT'
@@ -1629,6 +2305,37 @@ def test_fixed_hook_mode_feedback_timeouts_allow_slow_vehicle_status():
         literal_parameters
     )
     assert ('operating_bounds_enable', True) in literal_parameters
+
+
+def test_controller_declares_operator_hook_confirmation_parameters():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / 'bluerov2_control'
+        / 'mpc_track_trajectory_acados.py'
+    )
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    defaults = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == 'declare_parameter'
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            continue
+        try:
+            defaults[node.args[0].value] = ast.literal_eval(node.args[1])
+        except (ValueError, TypeError):
+            continue
+
+    assert isinstance(defaults['require_operator_hook_confirmation'], bool)
+    assert defaults['hook_confirmation_service'] == (
+        '/bluerov2/fixed_hook/confirm_hook'
+    )
+    assert defaults['hook_confirmation_min_wait_s'] == pytest.approx(0.25)
 
 
 def test_real_offboard_launch_defaults_are_safe_and_versioned(monkeypatch):

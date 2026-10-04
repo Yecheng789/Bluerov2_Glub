@@ -1,0 +1,45 @@
+# Controller-event evidence for three paper-figure trials
+
+The original controller logs are outside the trial folders. This compact record
+preserves the log hash and transition timestamps used by
+`three_success_trial_annotations.json`. Timestamps are ROS seconds.
+
+## retrieval_box_near_the_front_success
+
+Source: `/home/yecheng/.ros/log/python3_67408_1788100394397.log`
+SHA-256: `4552248ed306cc664beb56ea6c250d2012ca00c50d97396895ed28fed8c01d88`
+
+- 1788100404.582152827 — Mission enabled
+- 1788100404.656917459 — Mission -> TRACK_TO_PREHOOK
+- 1788100458.137055313 — Mission -> PREHOOK_REACHED
+- 1788100459.139283424 — Mission -> GO_FORWARD
+- 1788100494.456372969 — Mission -> WAIT_HOOK
+- 1788100515.657286040 — Mission -> GO_BACK
+- 1788100555.256375006 — Mission -> COMPLETE
+
+## retrieval_right_side_of_the_box_success
+
+Source: `/home/yecheng/.ros/log/python3_128824_1788107938088.log`
+SHA-256: `74ee1102d810547eaa50ee6fbfdd073eb49417d5f040a7a32db38cb271dd22ae`
+
+- 1788107946.647991530 — Mission enabled
+- 1788107946.700294765 — Mission -> TRACK_TO_PREHOOK
+- 1788107988.899817856 — Mission -> PREHOOK_REACHED
+- 1788107989.942009103 — Mission -> GO_FORWARD
+- 1788108034.739620085 — Mission -> WAIT_HOOK
+- 1788108053.781549446 — Mission -> GO_BACK
+- 1788108115.020355875 — Mission -> COMPLETE
+
+## retrieval_directly_in_front_of_the_box_success
+
+Source: `/home/yecheng/.ros/log/python3_47011_1788166926020.log`
+SHA-256: `b834bed2c12d15300d9599b1881337f460b1a100904db1f6943a60594c16371b`
+
+- 1788166936.309943609 — Mission enabled
+- 1788166936.376986418 — Mission -> TRACK_TO_PREHOOK
+- 1788166997.057851818 — Mission -> PREHOOK_REACHED
+- 1788166998.098325613 — Mission -> GO_FORWARD
+- 1788167237.257644268 — Mission -> WAIT_HOOK
+- 1788167295.058063211 — Mission -> GO_BACK
+- 1788167393.536379582 — Odometry stale; zero control
+- 1788167393.536837685 — Mission revoked; no COMPLETE event

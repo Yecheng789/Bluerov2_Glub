@@ -94,7 +94,7 @@ def test_existing_output_requires_explicit_overwrite(tmp_path):
 def test_safety_defaults_are_enabled():
     """Default recording uses finite, non-zero safety thresholds."""
     args, _ = parse_args([])
-    assert args.topic == '/mocap/glub_fb/pose'
+    assert args.topic == '/mocap/glub/pose'
     assert args.max_message_age_sec == pytest.approx(0.2)
     assert args.min_sampling_span_sec == pytest.approx(0.75)
     assert args.max_position_std_m == pytest.approx(0.015)

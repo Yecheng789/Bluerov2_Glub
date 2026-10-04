@@ -3,6 +3,7 @@ import shutil
 import heapq
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -20,12 +21,22 @@ from px4_msgs.msg import (
     VehicleTorqueSetpoint,
 )
 from std_msgs.msg import Bool, Empty
+from std_srvs.srv import Trigger
 
 from bluerov2_control.models.fossen_bluerov2_model import (
     build_bluerov2_fossen_model as build_bluerov2_fossen_model_sim,
 )
 from bluerov2_control.models.fossen_bluerov2_model_real import (
     build_bluerov2_fossen_model as build_bluerov2_fossen_model_real,
+)
+from bluerov2_control.planner_astar import (
+    OccupancyGrid2D as PlannerOccupancyGrid2D,
+    inflate_rect as planner_inflate_rect,
+    path_is_free as planner_path_is_free,
+    path_length as planner_path_length,
+    plan_xy_path as plan_real_xy_path,
+    project_point_to_path,
+    remaining_path_from_projection,
 )
 
 try:
@@ -70,6 +81,35 @@ def _validated_operating_bounds(
     return minimum, maximum
 
 
+def _parse_static_obstacle_rectangles(text):
+    """Parse semicolon-separated NED XY rectangles (xmin xmax ymin ymax)."""
+    raw = str(text).strip()
+    if not raw:
+        return []
+    rectangles = []
+    for index, group in enumerate(raw.split(';'), start=1):
+        values = group.replace(',', ' ').split()
+        if len(values) != 4:
+            raise ValueError(
+                "prehook_static_obstacles_ned_xyxy rectangle "
+                f"{index} must contain xmin xmax ymin ymax"
+            )
+        rectangle = tuple(float(value) for value in values)
+        if not all(math.isfinite(value) for value in rectangle):
+            raise ValueError(
+                "prehook_static_obstacles_ned_xyxy must contain only "
+                "finite values"
+            )
+        xmin, xmax, ymin, ymax = rectangle
+        if xmin >= xmax or ymin >= ymax:
+            raise ValueError(
+                "prehook_static_obstacles_ned_xyxy requires xmin < xmax "
+                "and ymin < ymax for every rectangle"
+            )
+        rectangles.append(rectangle)
+    return rectangles
+
+
 def quat_norm_wxyz(q):
     qw, qx, qy, qz = q
     n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
@@ -83,6 +123,18 @@ def quat_to_yaw_wxyz(q):
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def quat_to_rpy_wxyz(q):
+    """Return roll, pitch, yaw for a normalized WXYZ quaternion."""
+    qw, qx, qy, qz = quat_norm_wxyz(q)
+    sinr_cosp = 2.0 * (qw * qx + qy * qz)
+    cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+    sinp = clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0)
+    pitch = math.asin(sinp)
+    yaw = quat_to_yaw_wxyz((qw, qx, qy, qz))
+    return roll, pitch, yaw
 
 
 def euler_to_quat_wxyz(roll, pitch, yaw):
@@ -152,6 +204,38 @@ def quat_to_rotation_matrix_wxyz(q):
     ], dtype=float)
 
 
+def quat_to_rotation_matrix_sym_wxyz(q):
+    """Return a CasADi body-to-world rotation for a WXYZ quaternion."""
+    q_normalized = q / ca.sqrt(ca.dot(q, q) + 1e-12)
+    qw = q_normalized[0]
+    qx = q_normalized[1]
+    qy = q_normalized[2]
+    qz = q_normalized[3]
+    return ca.vertcat(
+        ca.horzcat(
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy - qz * qw),
+            2.0 * (qx * qz + qy * qw),
+        ),
+        ca.horzcat(
+            2.0 * (qx * qy + qz * qw),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz - qx * qw),
+        ),
+        ca.horzcat(
+            2.0 * (qx * qz - qy * qw),
+            2.0 * (qy * qz + qx * qw),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ),
+    )
+
+
+def forward_axis_angular_distance_wxyz(q0, q1):
+    """Return the angle between two body-X axes expressed in world frame."""
+    forward_0 = quat_to_rotation_matrix_wxyz(q0)[:, 0]
+    forward_1 = quat_to_rotation_matrix_wxyz(q1)[:, 0]
+    dot = clamp(float(np.dot(forward_0, forward_1)), -1.0, 1.0)
+    return math.acos(dot)
 
 
 def wrap_pi(a):
@@ -545,6 +629,22 @@ class MPCTrackTrajectoryAcados(Node):
             "return_to_pre_approach_after_hold",
             False,
         )
+        # Real fixed-hook retrieval latches the first arrival at the recorded
+        # Hook pose and waits until an operator explicitly confirms physical
+        # engagement.  Once WAIT_HOOK has been entered, later pose drift does
+        # not invalidate that operator-owned decision.  The service callback
+        # only arms a one-shot request; the 25 Hz control path performs the
+        # WAIT_HOOK -> GO_BACK transition while normal liveness gates remain
+        # fail-closed.
+        self.declare_parameter(
+            "require_operator_hook_confirmation",
+            False,
+        )
+        self.declare_parameter(
+            "hook_confirmation_service",
+            "/bluerov2/fixed_hook/confirm_hook",
+        )
+        self.declare_parameter("hook_confirmation_min_wait_s", 0.25)
         # A tighter vertical gate is used before the fixed-hook controller
         # advances onto its horizontal in/out line.  Zero preserves legacy
         # behaviour for launches that do not request this extra constraint.
@@ -560,6 +660,98 @@ class MPCTrackTrajectoryAcados(Node):
         self.declare_parameter("planner_mode", "astar")
         self.declare_parameter("planner_use_for_align", True)
         self.declare_parameter("planner_use_for_return", False)
+        # Real fixed-hook planner.  It deliberately uses the live controller's
+        # NED operating bounds rather than the Gazebo SDF geometry below.
+        self.declare_parameter("use_dynamic_prehook_planner", False)
+        self.declare_parameter("prehook_planner_check_rate_hz", 2.0)
+        self.declare_parameter("prehook_replan_deviation_m", 0.30)
+        self.declare_parameter("prehook_replan_deviation_hold_s", 0.50)
+        self.declare_parameter("prehook_replan_min_switch_interval_s", 1.0)
+        self.declare_parameter("prehook_replan_min_improvement_m", 0.15)
+        self.declare_parameter("prehook_replan_min_improvement_ratio", 0.10)
+        self.declare_parameter("prehook_replan_optimization_period_s", 2.0)
+        self.declare_parameter("prehook_reached_hold_s", 1.0)
+        # The recorded Hook attitude remains the compatibility default.  A
+        # real vehicle with a different static roll/pitch trim can instead
+        # capture those two axes at mission start while retaining the
+        # recorded Hook yaw used by the straight engagement corridor.
+        self.declare_parameter(
+            "prehook_attitude_reference_mode",
+            "recorded_hook",
+        )
+        # Zero inherits goal_reached_orientation_tol_rad.  Keeping this gate
+        # independent lets pre-hook accept a vehicle-specific trim without
+        # weakening the recorded Hook-pose gate used later in the sequence.
+        self.declare_parameter(
+            "prehook_reached_orientation_tol_rad",
+            0.0,
+        )
+        # The Splash trim profile deliberately permits several degrees of
+        # roll/pitch error before leaving pre-hook.  Yaw is safety-critical
+        # for the following 0.5 m body-forward corridor, so gate it
+        # independently instead of weakening it with the 3-D attitude gate.
+        self.declare_parameter(
+            "prehook_reached_yaw_tol_rad",
+            math.radians(3.0),
+        )
+        # Optional body-X direction gate.  Unlike the full quaternion gate,
+        # this ignores pure roll while still protecting the direction of the
+        # following body-forward engagement corridor.  Zero preserves the
+        # legacy full-attitude + yaw behaviour.
+        self.declare_parameter(
+            "prehook_reached_forward_axis_tol_rad",
+            0.0,
+        )
+        self.declare_parameter(
+            "prehook_attitude_alignment_timeout_s",
+            0.0,
+        )
+        self.declare_parameter(
+            "prehook_attitude_wait_exit_hysteresis_ratio",
+            1.5,
+        )
+        self.declare_parameter("prehook_static_obstacles_ned_xyxy", "")
+        self.declare_parameter("prehook_path_smoothing_iterations", 1)
+        self.declare_parameter("prehook_path_smoothing_corner_fraction", 0.20)
+        self.declare_parameter("prehook_path_smoothing_samples_per_corner", 4)
+        # Real GO_FORWARD/GO_BACK can use a Position-like, time-parameterized
+        # horizontal reference.  It never freezes or rewinds for ordinary
+        # corridor error: NMPC keeps translating while correcting NED depth,
+        # lateral position, and attitude.  False retains the older measured-
+        # progress interlock for simulation and compatibility launches.
+        self.declare_parameter(
+            "fixed_hook_line_position_mode",
+            False,
+        )
+        # Parameters below configure the compatibility progress governor, or
+        # the velocity weight retained by Position-like translation.
+        self.declare_parameter(
+            "fixed_hook_line_cross_track_tol_m",
+            0.03,
+        )
+        self.declare_parameter(
+            "fixed_hook_line_yaw_tol_rad",
+            math.radians(3.0),
+        )
+        self.declare_parameter(
+            "fixed_hook_line_max_reference_lead_m",
+            0.02,
+        )
+        # Enter the corridor interlock at the configured tolerances, then
+        # require all errors to fall below this fraction before releasing it.
+        # The hysteresis prevents 25 Hz freeze/resume chatter around 3 cm.
+        self.declare_parameter(
+            "fixed_hook_line_interlock_release_ratio",
+            0.8,
+        )
+        # Multiplies the velocity-error cost only while tracking the final
+        # fixed Hook line.  The controller default preserves legacy launches;
+        # the audited real launch raises it to overcome measured tether/current
+        # resistance without changing A* or pre-hook tracking behaviour.
+        self.declare_parameter(
+            "fixed_hook_line_velocity_weight_multiplier",
+            1.0,
+        )
         self.declare_parameter("world_sdf_path", "/home/yecheng/PX4-Autopilot/Tools/simulation/gz/worlds/kth_marinarium.sdf")
         self.declare_parameter("tank_model_sdf_path", "/home/yecheng/PX4-Autopilot/Tools/simulation/gz/models/kth_tank/model.sdf")
         self.declare_parameter("astar_resolution", 0.15)
@@ -716,6 +908,14 @@ class MPCTrackTrajectoryAcados(Node):
         controller_heartbeat_topic = self.get_parameter(
             "controller_heartbeat_topic"
         ).value
+        hook_confirmation_service = str(
+            self.get_parameter("hook_confirmation_service").value
+        ).strip()
+        self.require_operator_hook_confirmation = bool(
+            self.get_parameter(
+                "require_operator_hook_confirmation"
+            ).value
+        )
 
         self.operating_bounds_enabled = bool(
             self.get_parameter("operating_bounds_enable").value
@@ -789,6 +989,33 @@ class MPCTrackTrajectoryAcados(Node):
         self._trajectory_reset_pending = True
         self.fixed_hook_projected_restart = False
         self._planner_geometry_cache = None
+        self._prehook_planner_grid_cache = None
+        self._prehook_replan_executor = None
+        self._prehook_replan_future = None
+        self._prehook_replan_context = None
+        self._prehook_mandatory_replan_pending = False
+        self._prehook_plan_generation = 0
+        self._prehook_path_progress_m = 0.0
+        self._prehook_deviation_since_monotonic = None
+        self._prehook_last_check_monotonic = None
+        self._prehook_last_switch_monotonic = None
+        self._prehook_last_optimization_monotonic = None
+        self._prehook_reached_since_sec = None
+        self._prehook_attitude_wait_since_monotonic = None
+        self._prehook_attitude_fault_latched = False
+        self._prehook_trim_q_wxyz = None
+        self._prehook_planner_hold_active = False
+        self._fixed_hook_line_progress_m = 0.0
+        self._fixed_hook_line_actual_progress_m = 0.0
+        self._fixed_hook_line_raw_progress_m = 0.0
+        self._fixed_hook_line_interlock_active = False
+        self._fixed_hook_line_interlock_reason = ""
+        self._operator_hook_confirmation_pending = False
+        self._wait_hook_enter_monotonic = None
+        self._prehook_planner_hold_pos = np.zeros(3, dtype=float)
+        self._prehook_planner_hold_q_wxyz = np.array(
+            [1.0, 0.0, 0.0, 0.0], dtype=float
+        )
 
         self.mission_state = "INIT"
         self.state_enter_time_sec = 0.0
@@ -851,10 +1078,30 @@ class MPCTrackTrajectoryAcados(Node):
                 "fixed_hook_depth_tolerance_m"
             )
         )
+        self.hook_confirmation_min_wait_s = (
+            self._finite_nonnegative_parameter(
+                "hook_confirmation_min_wait_s"
+            )
+        )
         self.position_integral_error_world = np.zeros(3, dtype=float)
         self.last_position_integral_update_sec = None
 
+        self._validate_dynamic_prehook_planner_parameters()
+        self._validate_operator_hook_confirmation_parameters()
+
         self._build_mpc()
+        if self._dynamic_prehook_planner_enabled():
+            self._prehook_replan_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="prehook_astar",
+            )
+        self.hook_confirmation_service = None
+        if self.require_operator_hook_confirmation:
+            self.hook_confirmation_service = self.create_service(
+                Trigger,
+                hook_confirmation_service,
+                self.on_hook_confirmation,
+            )
 
         self.get_logger().info(
             "acados tracking MPC "
@@ -867,6 +1114,12 @@ class MPCTrackTrajectoryAcados(Node):
             )
         else:
             self.get_logger().info("Mission-enable gate bypassed (legacy/simulation mode).")
+        if self.hook_confirmation_service is not None:
+            self.get_logger().info(
+                "WAIT_HOOK requires operator confirmation; run the dedicated "
+                "keyboard node and press H only after visually confirming "
+                f"engagement (service: {hook_confirmation_service})."
+            )
         if self.operating_bounds_enabled:
             self.get_logger().info(
                 "NED operating bounds enabled: "
@@ -911,11 +1164,116 @@ class MPCTrackTrajectoryAcados(Node):
             if was_enabled:
                 self.get_logger().info("acados tracking MPC disabled; zero command published.")
 
+    def _clear_operator_hook_confirmation(self):
+        self._operator_hook_confirmation_pending = False
+        self._wait_hook_enter_monotonic = None
+
+    def on_hook_confirmation(self, request, response):
+        """Accept one fresh operator confirmation in a healthy latched wait."""
+        del request
+        response.success = False
+
+        if not bool(
+            getattr(self, "require_operator_hook_confirmation", False)
+        ):
+            response.message = (
+                "operator hook confirmation is disabled for this controller"
+            )
+            return response
+        if self.mission_state != "WAIT_HOOK":
+            response.message = (
+                "confirmation rejected: mission state is "
+                f"{self.mission_state}, not WAIT_HOOK"
+            )
+            return response
+        wait_enter_monotonic = getattr(
+            self,
+            "_wait_hook_enter_monotonic",
+            None,
+        )
+        minimum_wait_s = max(
+            float(
+                getattr(
+                    self,
+                    "hook_confirmation_min_wait_s",
+                    0.25,
+                )
+            ),
+            0.0,
+        )
+        wait_age_s = (
+            float("-inf")
+            if wait_enter_monotonic is None
+            else time.monotonic() - float(wait_enter_monotonic)
+        )
+        if not math.isfinite(wait_age_s) or wait_age_s < minimum_wait_s:
+            response.message = (
+                "confirmation rejected: WAIT_HOOK entry is too recent; "
+                f"wait at least {minimum_wait_s:.2f}s and press a new H"
+            )
+            return response
+        if self._operator_hook_confirmation_pending:
+            response.message = (
+                "confirmation already accepted; waiting for the next "
+                "control update"
+            )
+            return response
+        if not self._mission_allowed():
+            response.message = (
+                "confirmation rejected: mission enable is inactive or "
+                "safety-latched"
+            )
+            return response
+        if not self._control_gate_active():
+            response.message = (
+                "confirmation rejected: Armed + Offboard feedback is not "
+                "active and fresh"
+            )
+            return response
+        if self.ocp_solver is None:
+            response.message = (
+                "confirmation rejected: MPC solver is unavailable"
+            )
+            return response
+        if not self._odom_fresh() or not self._state_valid(self._x_meas()):
+            response.message = (
+                "confirmation rejected: odometry/state is absent, stale, "
+                "or invalid"
+            )
+            return response
+        if not self._command_fresh():
+            response.message = (
+                "confirmation rejected: MPC command is stale"
+            )
+            return response
+        self._operator_hook_confirmation_pending = True
+        response.success = True
+        response.message = (
+            "Hook confirmation accepted; GO_BACK will start on the next "
+            "healthy control update"
+        )
+        self.get_logger().info(
+            "Operator Hook confirmation accepted from the latched "
+            "WAIT_HOOK state; GO_BACK is armed for the next healthy control "
+            "update without rechecking Hook-pose tolerance."
+        )
+        return response
+
     def on_mission_enable(self, msg: Bool):
         was_allowed = self._mission_allowed()
         requested = bool(msg.data)
 
         if not requested:
+            self._operator_hook_confirmation_pending = False
+            self._wait_hook_enter_monotonic = None
+            self._prehook_trim_q_wxyz = None
+            if getattr(self, "_prehook_attitude_fault_latched", False):
+                self.get_logger().info(
+                    "Pre-hook attitude fault hold cleared by explicit "
+                    "mission false. Re-enable only after DISARM inspection "
+                    "and a corrected Splash target/calibration."
+                )
+            self._prehook_attitude_fault_latched = False
             self.mission_enable = False
             if self.mission_rearm_required:
                 self.mission_rearm_required = False
@@ -986,9 +1344,6 @@ class MPCTrackTrajectoryAcados(Node):
                     "Odometry timestamp_sample is duplicate or non-increasing."
                 )
                 return
-        if timestamp_sample > 0:
-            self.last_odom_timestamp_sample = timestamp_sample
-
         p_w = np.array([float(msg.position[0]), float(msg.position[1]), float(msg.position[2])], dtype=float)
         q_wxyz = np.array(
             [float(msg.q[0]), float(msg.q[1]), float(msg.q[2]), float(msg.q[3])],
@@ -1048,7 +1403,10 @@ class MPCTrackTrajectoryAcados(Node):
             self.last_valid_position is not None
             and self.last_valid_quat_wxyz is not None
             and bool(self.get_parameter("require_mission_enable").value)
-            and self.mission_enable
+            and (
+                self.mission_enable
+                or self.mission_rearm_required
+            )
         ):
             position_jump_m = float(
                 np.linalg.norm(p_w - self.last_valid_position)
@@ -1070,6 +1428,35 @@ class MPCTrackTrajectoryAcados(Node):
                 and orientation_jump_rad > max_orientation_jump_rad
             )
 
+        if jump_detected:
+            # A discontinuous candidate is not odometry.  Keep the complete
+            # last trusted snapshot (including its reception/header times) so
+            # neither the controller nor a later candidate can treat this
+            # sample as the new continuity anchor.  The rearm latch keeps the
+            # same comparison active until an explicit mission-false reset.
+            reason = (
+                "Odometry jump detected "
+                f"(position={position_jump_m:.3f}m, "
+                f"orientation={orientation_jump_rad:.3f}rad)."
+            )
+            if not self.mission_rearm_required:
+                self._revoke_mission_enable(reason)
+            else:
+                # The first bad candidate already zeroed and latched the
+                # mission.  Avoid resetting/logging at the odometry rate while
+                # continuing to reject every candidate against the same
+                # trusted anchor.
+                self.get_logger().error(
+                    f"{reason} Candidate remains rejected by the active "
+                    "mission safety latch.",
+                    throttle_duration_sec=1.0,
+                )
+            return
+
+        # Commit the candidate atomically only after every frame, quality,
+        # finite-state, bounds, tilt, and continuity check has passed.
+        if timestamp_sample > 0:
+            self.last_odom_timestamp_sample = timestamp_sample
         self.last_odom_sec = self._now_sec()
         self.p_w = p_w
         self.q_wxyz = tuple(q_wxyz.tolist())
@@ -1079,14 +1466,6 @@ class MPCTrackTrajectoryAcados(Node):
         self.odom_valid = True
         self.last_valid_position = p_w.copy()
         self.last_valid_quat_wxyz = tuple(q_wxyz.tolist())
-
-        if jump_detected:
-            self._revoke_mission_enable(
-                "Odometry jump detected "
-                f"(position={position_jump_m:.3f}m, "
-                f"orientation={orientation_jump_rad:.3f}rad)."
-            )
-            return
 
         if not hasattr(self, "_logged_frame_once"):
             self._logged_frame_once = True
@@ -1123,13 +1502,15 @@ class MPCTrackTrajectoryAcados(Node):
 
         if model_type == "fossen":
             x_sym, u_sym, xdot_fun, _ = build_bluerov2_fossen_model_sim(Ts)
-            model_name = "bluerov2_fossen_track"
+            model_name = "bluerov2_fossen_track_world_vref_v2"
             xdot_expr = xdot_fun(x_sym, u_sym)
         elif model_type == "fossen_real":
             x_sym, u_sym, xdot_fun, _ = build_bluerov2_fossen_model_real(
                 Ts, robot_type=robot_type
             )
-            model_name = f"bluerov2_fossen_real_{robot_type}_track"
+            model_name = (
+                f"bluerov2_fossen_real_{robot_type}_track_world_vref_v2"
+            )
             xdot_expr = xdot_fun(x_sym, u_sym)
         elif model_type in ("rigid", "rigid_body"):
             m = float(self.get_parameter("mass").value)
@@ -1137,17 +1518,25 @@ class MPCTrackTrajectoryAcados(Node):
             Iy = float(self.get_parameter("Iy").value)
             Iz = float(self.get_parameter("Iz").value)
             x_sym, u_sym, xdot_expr = build_rigid_body_explicit_model(m, Ix, Iy, Iz)
-            model_name = "bluerov2_rigid_body_track"
+            model_name = "bluerov2_rigid_body_track_world_vref_v2"
         else:
             raise ValueError(
                 f"Unknown model_type {model_type!r}; expected "
                 "'fossen', 'fossen_real', 'rigid', or 'rigid_body'."
             )
 
-        p_sym = ca.SX.sym("p", 8)
+        # Parameters 8:11 are a NED/world-frame velocity reference and
+        # parameter 11 scales its residual. They remain zero and one for
+        # legacy trajectories. Comparing velocity in the world frame is
+        # important for the fixed Hook line: its horizontal reference must
+        # always mean zero NED-depth velocity even while measured and
+        # reference roll/pitch differ.
+        p_sym = ca.SX.sym("p", 12)
         pref = p_sym[0:3]
         qref = p_sym[3:7]
         hold_att_flag = p_sym[7]
+        vref_world = p_sym[8:11]
+        velocity_cost_scale = p_sym[11]
 
         model = AcadosModel()
         model.name = model_name
@@ -1190,8 +1579,20 @@ class MPCTrackTrajectoryAcados(Node):
         q_err = ca.if_else(q_w < 0, -q_err, q_err)
         att_res = hold_att_flag * q_err[1:4]
 
-        y_stage = ca.vertcat(pos_err, att_res, vel, omega, F, tau)
-        y_term = ca.vertcat(pos_err, att_res, vel, omega)
+        rotation_body_to_world = quat_to_rotation_matrix_sym_wxyz(q)
+        velocity_world = rotation_body_to_world @ vel
+        velocity_error = velocity_cost_scale * (
+            velocity_world - vref_world
+        )
+        y_stage = ca.vertcat(
+            pos_err,
+            att_res,
+            velocity_error,
+            omega,
+            F,
+            tau,
+        )
+        y_term = ca.vertcat(pos_err, att_res, velocity_error, omega)
 
         model.cost_y_expr = y_stage
         model.cost_y_expr_e = y_term
@@ -1200,7 +1601,8 @@ class MPCTrackTrajectoryAcados(Node):
         ocp.model = model
         ocp.solver_options.N_horizon = N
         ocp.solver_options.tf = N * Ts
-        ocp.parameter_values = np.zeros(8)
+        ocp.parameter_values = np.zeros(12)
+        ocp.parameter_values[11] = 1.0
 
         ocp.cost.cost_type = "NONLINEAR_LS"
         ocp.cost.cost_type_e = "NONLINEAR_LS"
@@ -1303,6 +1705,17 @@ class MPCTrackTrajectoryAcados(Node):
         return self.active_goal_pos.copy()
 
     def _goal_quaternion(self):
+        dynamic_prehook_enabled = getattr(
+            self,
+            "_dynamic_prehook_planner_enabled",
+            lambda: False,
+        )
+        if (
+            dynamic_prehook_enabled()
+            and getattr(self, "mission_state", "")
+            in ("PLAN_TO_PREHOOK", "TRACK_TO_PREHOOK", "PREHOOK_REACHED")
+        ):
+            return self._prehook_reference_quaternion()
         self.q_goal = euler_to_quat_wxyz(
             float(self.get_parameter("goal_roll").value),
             float(self.get_parameter("goal_pitch").value),
@@ -1310,6 +1723,81 @@ class MPCTrackTrajectoryAcados(Node):
         )
         return np.array(self.q_goal, dtype=float)
 
+    def _recorded_hook_quaternion(self):
+        return np.asarray(
+            euler_to_quat_wxyz(
+                float(self.get_parameter("goal_roll").value),
+                float(self.get_parameter("goal_pitch").value),
+                self._goal_yaw_static(),
+            ),
+            dtype=float,
+        )
+
+    def _prehook_attitude_reference_mode(self):
+        return str(
+            self.get_parameter("prehook_attitude_reference_mode").value
+        ).strip().lower()
+
+    def _capture_prehook_trim_if_needed(self):
+        if self._prehook_attitude_reference_mode() != "capture_start_trim":
+            return
+        if getattr(self, "_prehook_trim_q_wxyz", None) is not None:
+            return
+        current_roll, current_pitch, _current_yaw = quat_to_rpy_wxyz(
+            self.q_wxyz
+        )
+        self._prehook_trim_q_wxyz = np.asarray(
+            euler_to_quat_wxyz(
+                current_roll,
+                current_pitch,
+                self._goal_yaw_static(),
+            ),
+            dtype=float,
+        )
+        self.get_logger().info(
+            "Captured pre-hook attitude trim: current roll/pitch plus "
+            "recorded Hook yaw. This reference is retained through all "
+            "pre-hook replans."
+        )
+
+    def _prehook_reference_quaternion(self):
+        trim = getattr(self, "_prehook_trim_q_wxyz", None)
+        if (
+            self._prehook_attitude_reference_mode() == "capture_start_trim"
+            and trim is not None
+        ):
+            return np.asarray(trim, dtype=float).copy()
+        return self._recorded_hook_quaternion()
+
+    def _prehook_orientation_tolerance_rad(self):
+        tolerance = float(
+            self.get_parameter(
+                "prehook_reached_orientation_tol_rad"
+            ).value
+        )
+        if tolerance <= 0.0:
+            tolerance = float(
+                self.get_parameter(
+                    "goal_reached_orientation_tol_rad"
+                ).value
+            )
+        return max(tolerance, 1e-4)
+
+    def _prehook_yaw_tolerance_rad(self):
+        tolerance = float(
+            self.get_parameter("prehook_reached_yaw_tol_rad").value
+        )
+        return max(tolerance, 1e-4)
+
+    def _prehook_forward_axis_tolerance_rad(self):
+        return max(
+            float(
+                self.get_parameter(
+                    "prehook_reached_forward_axis_tol_rad"
+                ).value
+            ),
+            0.0,
+        )
 
     def _box_center_ctrl(self):
         return np.array([
@@ -1403,7 +1891,15 @@ class MPCTrackTrajectoryAcados(Node):
             if (
                 self._pre_approach_waypoint_enabled()
                 and self.mission_state
-                in ("PRE_APPROACH", "RETREAT", "COMPLETE")
+                in (
+                    "PLAN_TO_PREHOOK",
+                    "TRACK_TO_PREHOOK",
+                    "PREHOOK_REACHED",
+                    "PRE_APPROACH",
+                    "GO_BACK",
+                    "RETREAT",
+                    "COMPLETE",
+                )
             ):
                 self.active_goal_pos = self._pre_approach_position()
             else:
@@ -1531,6 +2027,211 @@ class MPCTrackTrajectoryAcados(Node):
             )
         return value
 
+    def _dynamic_prehook_planner_enabled(self):
+        return bool(
+            self.get_parameter("use_dynamic_prehook_planner").value
+        )
+
+    def _validate_dynamic_prehook_planner_parameters(self):
+        if not self._dynamic_prehook_planner_enabled():
+            return
+        if str(self.get_parameter("planner_mode").value).strip().lower() != "astar":
+            raise ValueError(
+                "use_dynamic_prehook_planner=true requires planner_mode=astar"
+            )
+        if bool(self.get_parameter("use_box_recovery_mission").value):
+            raise ValueError(
+                "dynamic pre-hook planning is only valid for the fixed-hook "
+                "mission"
+            )
+        if not bool(
+            self.get_parameter("require_mission_enable").value
+        ):
+            raise ValueError(
+                "dynamic pre-hook planning requires "
+                "require_mission_enable=true for fail-closed A* failures"
+            )
+        if not self._pre_approach_waypoint_enabled():
+            raise ValueError(
+                "dynamic pre-hook planning requires use_pre_approach_waypoint=true"
+            )
+        if not self.operating_bounds_enabled:
+            raise ValueError(
+                "dynamic pre-hook planning requires real NED operating bounds"
+            )
+
+        check_rate_hz = self._finite_positive_parameter(
+            "prehook_planner_check_rate_hz"
+        )
+        if not 2.0 <= check_rate_hz <= 5.0:
+            raise ValueError(
+                "prehook_planner_check_rate_hz must be in [2, 5] Hz"
+            )
+        self._finite_positive_parameter("prehook_replan_deviation_m")
+        self._finite_nonnegative_parameter(
+            "prehook_replan_deviation_hold_s"
+        )
+        self._finite_nonnegative_parameter(
+            "prehook_replan_min_switch_interval_s"
+        )
+        self._finite_nonnegative_parameter(
+            "prehook_replan_min_improvement_m"
+        )
+        self._finite_fraction_parameter(
+            "prehook_replan_min_improvement_ratio"
+        )
+        self._finite_nonnegative_parameter(
+            "prehook_replan_optimization_period_s"
+        )
+        self._finite_nonnegative_parameter("prehook_reached_hold_s")
+        attitude_reference_mode = self._prehook_attitude_reference_mode()
+        if attitude_reference_mode not in (
+            "recorded_hook",
+            "capture_start_trim",
+        ):
+            raise ValueError(
+                "prehook_attitude_reference_mode must be one of: "
+                "recorded_hook, capture_start_trim"
+            )
+        self._finite_nonnegative_parameter(
+            "prehook_reached_orientation_tol_rad"
+        )
+        prehook_yaw_tolerance = self._finite_positive_parameter(
+            "prehook_reached_yaw_tol_rad"
+        )
+        if prehook_yaw_tolerance > math.pi:
+            raise ValueError(
+                "prehook_reached_yaw_tol_rad must be <= pi"
+            )
+        forward_axis_tolerance = self._finite_nonnegative_parameter(
+            "prehook_reached_forward_axis_tol_rad"
+        )
+        if forward_axis_tolerance > math.pi:
+            raise ValueError(
+                "prehook_reached_forward_axis_tol_rad must be <= pi"
+            )
+        attitude_timeout_s = self._finite_nonnegative_parameter(
+            "prehook_attitude_alignment_timeout_s"
+        )
+        if 0.0 < attitude_timeout_s < 5.0:
+            raise ValueError(
+                "prehook_attitude_alignment_timeout_s must be 0 "
+                "(disabled) or >= 5.0"
+            )
+        hysteresis_ratio = self._finite_positive_parameter(
+            "prehook_attitude_wait_exit_hysteresis_ratio"
+        )
+        if hysteresis_ratio < 1.0:
+            raise ValueError(
+                "prehook_attitude_wait_exit_hysteresis_ratio must be "
+                ">= 1.0"
+            )
+        self._finite_positive_parameter(
+            "fixed_hook_line_cross_track_tol_m"
+        )
+        line_yaw_tolerance = self._finite_positive_parameter(
+            "fixed_hook_line_yaw_tol_rad"
+        )
+        if line_yaw_tolerance > math.pi:
+            raise ValueError(
+                "fixed_hook_line_yaw_tol_rad must be <= pi"
+            )
+        self._finite_positive_parameter(
+            "fixed_hook_line_max_reference_lead_m"
+        )
+        line_interlock_release_ratio = self._finite_positive_parameter(
+            "fixed_hook_line_interlock_release_ratio"
+        )
+        if line_interlock_release_ratio > 1.0:
+            raise ValueError(
+                "fixed_hook_line_interlock_release_ratio must be <= 1"
+            )
+        line_velocity_weight_multiplier = (
+            self._finite_positive_parameter(
+                "fixed_hook_line_velocity_weight_multiplier"
+            )
+        )
+        if not 1.0 <= line_velocity_weight_multiplier <= 50.0:
+            raise ValueError(
+                "fixed_hook_line_velocity_weight_multiplier must be in "
+                "[1, 50]"
+            )
+        self._finite_positive_parameter("astar_resolution")
+        self._finite_nonnegative_parameter("astar_robot_radius")
+        self._finite_nonnegative_parameter("astar_obstacle_margin")
+
+        smoothing_iterations = int(
+            self.get_parameter("prehook_path_smoothing_iterations").value
+        )
+        smoothing_samples = int(
+            self.get_parameter(
+                "prehook_path_smoothing_samples_per_corner"
+            ).value
+        )
+        smoothing_fraction = float(
+            self.get_parameter(
+                "prehook_path_smoothing_corner_fraction"
+            ).value
+        )
+        if smoothing_iterations < 0 or smoothing_iterations > 4:
+            raise ValueError(
+                "prehook_path_smoothing_iterations must be in [0, 4]"
+            )
+        if smoothing_samples < 2 or smoothing_samples > 12:
+            raise ValueError(
+                "prehook_path_smoothing_samples_per_corner must be in [2, 12]"
+            )
+        if not math.isfinite(smoothing_fraction) or not (
+            0.0 < smoothing_fraction < 0.5
+        ):
+            raise ValueError(
+                "prehook_path_smoothing_corner_fraction must be in (0, 0.5)"
+            )
+        _parse_static_obstacle_rectangles(
+            self.get_parameter(
+                "prehook_static_obstacles_ned_xyxy"
+            ).value
+        )
+
+    def _validate_operator_hook_confirmation_parameters(self):
+        if not bool(
+            self.get_parameter(
+                "require_operator_hook_confirmation"
+            ).value
+        ):
+            return
+        if not self._dynamic_prehook_planner_enabled():
+            raise ValueError(
+                "require_operator_hook_confirmation=true requires "
+                "use_dynamic_prehook_planner=true"
+            )
+        if not bool(
+            self.get_parameter(
+                "require_mission_enable"
+            ).value
+        ):
+            raise ValueError(
+                "operator hook confirmation requires "
+                "require_mission_enable=true"
+            )
+        if not bool(
+            self.get_parameter(
+                "return_to_pre_approach_after_hold"
+            ).value
+        ):
+            raise ValueError(
+                "operator hook confirmation requires "
+                "return_to_pre_approach_after_hold=true"
+            )
+        service_name = str(
+            self.get_parameter("hook_confirmation_service").value
+        ).strip()
+        if not service_name or not service_name.startswith("/"):
+            raise ValueError(
+                "hook_confirmation_service must be a non-empty absolute "
+                "ROS service name"
+            )
+
     def _mission_allowed(self):
         if not bool(self.get_parameter("require_mission_enable").value):
             return True
@@ -1566,9 +2267,20 @@ class MPCTrackTrajectoryAcados(Node):
 
     def _controller_heartbeat_ready(self):
         """Return true only while the external Offboard manager may stream."""
-        if self.ocp_solver is None or self.mission_rearm_required:
+        if self.ocp_solver is None:
             return False
         if not self._control_mode_feedback_fresh():
+            return False
+
+        if getattr(self, "_prehook_attitude_fault_latched", False):
+            # This latch is entered only from a healthy Armed + Offboard
+            # pre-hook alignment.  Keep PX4 in wrench Offboard containment
+            # until the operator DISARMs, even if a later MoCap/odom fault
+            # also sets the generic mission-rearm latch.  publish_tick still
+            # fails every degraded command path to an explicit zero wrench.
+            return bool(self.enabled)
+
+        if self.mission_rearm_required:
             return False
         if not self._odom_fresh() or not self._state_valid(self._x_meas()):
             return False
@@ -1644,9 +2356,111 @@ class MPCTrackTrajectoryAcados(Node):
         self.position_integral_error_world[:] = 0.0
         self.last_position_integral_update_sec = None
 
+    def _clear_position_integral_xy_preserve_z(self):
+        """Drop waypoint XY bias without stepping world-Z support."""
+        vertical_integral = float(self.position_integral_error_world[2])
+        if not math.isfinite(vertical_integral):
+            vertical_integral = 0.0
+        self.position_integral_error_world[:] = 0.0
+        self.position_integral_error_world[2] = vertical_integral
+        self.last_position_integral_update_sec = None
+
+    def _discard_upward_world_z_integral(self):
+        """Keep learned downward support but drop an upward transit bias."""
+        vertical_integral = float(self.position_integral_error_world[2])
+        if not math.isfinite(vertical_integral):
+            vertical_integral = 0.0
+        # NED +Z is down. Both real vehicle presets are positively buoyant,
+        # so a negative stored term subtracts hover support. Entering the
+        # straight transit with that term while already rising caused the
+        # measured 12.5 cm first heave overshoot.
+        self.position_integral_error_world[2] = max(
+            vertical_integral,
+            0.0,
+        )
+        self.last_position_integral_update_sec = None
+
+    def _fixed_hook_line_normal_world(self):
+        """Return the horizontal unit normal of the active Hook line."""
+        line_delta_xy = np.asarray(
+            self.traj_goal_pos[0:2] - self.traj_start_pos[0:2],
+            dtype=float,
+        )
+        line_length_m = float(np.linalg.norm(line_delta_xy))
+        if not math.isfinite(line_length_m) or line_length_m <= 1e-9:
+            return None
+        line_unit_xy = line_delta_xy / line_length_m
+        return np.array([
+            -line_unit_xy[1],
+            line_unit_xy[0],
+            0.0,
+        ], dtype=float)
+
+    def _project_position_integral_to_fixed_hook_normal(self):
+        """Retain cross-current and heave bias, never along-line bias."""
+        line_normal_world = (
+            MPCTrackTrajectoryAcados._fixed_hook_line_normal_world(self)
+        )
+        if line_normal_world is None:
+            self.position_integral_error_world[0:2] = 0.0
+            return None
+        normal_integral = float(np.dot(
+            self.position_integral_error_world,
+            line_normal_world,
+        ))
+        self.position_integral_error_world[0:2] = (
+            normal_integral * line_normal_world[0:2]
+        )
+        return line_normal_world
+
+    def _retire_prehook_plan_request(self):
+        """Invalidate a plan generation without orphaning running work."""
+        self._prehook_plan_generation = int(
+            getattr(self, "_prehook_plan_generation", 0)
+        ) + 1
+        future = getattr(self, "_prehook_replan_future", None)
+        clear_future = future is None
+        if future is not None:
+            clear_future = bool(future.cancel() or future.done())
+        if clear_future:
+            self._prehook_replan_future = None
+            self._prehook_replan_context = None
+        # If cancel() fails, the single worker is already executing this job.
+        # Retain its future/context so PLAN can poll and discard the stale
+        # generation before submitting a replacement.  Dropping ownership
+        # here would let repeated resets queue unbounded invisible jobs.
+
+    def _reset_dynamic_prehook_runtime(self):
+        self._retire_prehook_plan_request()
+        self._prehook_mandatory_replan_pending = False
+        self._prehook_path_progress_m = 0.0
+        self._prehook_deviation_since_monotonic = None
+        self._prehook_last_check_monotonic = None
+        self._prehook_last_switch_monotonic = None
+        self._prehook_last_optimization_monotonic = None
+        self._prehook_reached_since_sec = None
+        self._prehook_attitude_wait_since_monotonic = None
+        self._operator_hook_confirmation_pending = False
+        self._wait_hook_enter_monotonic = None
+        # A generic command/trajectory reset must not silently clear an
+        # attitude-timeout fault and resume motion. Only an explicit mission
+        # false in on_mission_enable() clears this operator-owned latch.
+        self._prehook_planner_hold_active = bool(
+            getattr(self, "_prehook_attitude_fault_latched", False)
+        )
+
     def _position_integral_reference_finished(self, now_sec):
         if not self.traj_active:
             return True
+        if getattr(
+            self,
+            "_fixed_hook_line_governor_active",
+            lambda: False,
+        )():
+            # The nominal 0.5/speed duration is diagnostic only for a
+            # measured-progress line. Never let wall time activate endpoint
+            # XY integral while GO_FORWARD/GO_BACK is still in transit.
+            return False
         return now_sec >= (
             self.traj_start_time_sec + self.traj_duration_sec
         )
@@ -1660,14 +2474,35 @@ class MPCTrackTrajectoryAcados(Node):
             total_limits,
         )
 
+        prehook_planner_hold_active = (
+            getattr(self, "_prehook_planner_hold_active", False)
+            and getattr(self, "mission_state", "")
+            in ("PLAN_TO_PREHOOK", "TRACK_TO_PREHOOK")
+        )
+        prehook_fault_hold_active = (
+            prehook_planner_hold_active
+            and bool(getattr(
+                self,
+                "_prehook_attitude_fault_latched",
+                False,
+            ))
+        )
+        if prehook_planner_hold_active and not prehook_fault_hold_active:
+            # The NMPC reference is the captured hold pose while A* runs.
+            # Integrating against _goal_position() here would instead wind up
+            # toward pre-hook and silently bypass the planner hold semantics.
+            self._reset_position_integral()
+            return base_force
+
         gain = self.position_integral_gain
         bias_fraction = self.position_integral_force_limit_fraction
         if gain <= 0.0 or bias_fraction <= 0.0:
             self._reset_position_integral()
             return base_force
 
-        reference_finished = self._position_integral_reference_finished(
-            now_sec
+        reference_finished = (
+            prehook_fault_hold_active
+            or self._position_integral_reference_finished(now_sec)
         )
         fixed_hook_transit = (
             not reference_finished
@@ -1675,39 +2510,108 @@ class MPCTrackTrajectoryAcados(Node):
         )
         if not reference_finished and not fixed_hook_transit:
             # Do not integrate normal lag behind a moving reference.  The
-            # fixed-hook horizontal segment is the sole exception below: it
-            # freezes and reuses only the previously learned world-Z bias.
+            # fixed-hook horizontal segment is the sole exception below: its
+            # along-track reference moves, but its cross-track and depth
+            # references remain fixed for the whole straight corridor.
             self._reset_position_integral()
             return base_force
 
         if fixed_hook_transit:
-            # The required heave compensation should not disappear merely
-            # because the XY reference starts moving.  Freeze it (do not
-            # integrate endpoint error during transit), and keep XY bias zero.
-            self.position_integral_error_world[0:2] = 0.0
-            self.last_position_integral_update_sec = None
-        else:
-            position_error_world = self._goal_position() - self.p_w
-            error_norm = float(np.linalg.norm(position_error_world))
-            if (
-                not np.all(np.isfinite(position_error_world))
-                or error_norm > self.position_integral_activation_error_m
-            ):
-                # A large error is more likely a bad reference, obstruction,
-                # or frame problem.  Do not let the integral mask it.
+            # Along-track lag belongs to the moving reference and must never
+            # wind up.  Cross-track and depth references, however, are fixed
+            # for the whole straight Hook corridor.  Retain the bounded
+            # learned cross-current/heave support and update only the line-
+            # normal component.  This prevents a stage transition from
+            # dropping the force that was holding the pre-hook waypoint.
+            line_normal_world = (
+                MPCTrackTrajectoryAcados
+                ._project_position_integral_to_fixed_hook_normal(self)
+            )
+            if line_normal_world is None:
                 self._reset_position_integral()
                 return base_force
-
-            if self.last_position_integral_update_sec is None:
+            cross_track_error_m = float(np.dot(
+                np.asarray(self.traj_start_pos, dtype=float) - self.p_w,
+                line_normal_world,
+            ))
+            depth_error_m = float(
+                np.asarray(self.traj_start_pos, dtype=float)[2]
+                - self.p_w[2]
+            )
+            fixed_reference_error_m = math.hypot(
+                cross_track_error_m,
+                depth_error_m,
+            )
+            if (
+                not math.isfinite(cross_track_error_m)
+                or not math.isfinite(depth_error_m)
+                or fixed_reference_error_m
+                > self.position_integral_activation_error_m
+            ):
+                # Do not let an integral conceal a gross corridor/frame
+                # error. Preserve the already bounded compensation without
+                # accumulating it further, and avoid a large resumed dt.
+                self.last_position_integral_update_sec = None
+            elif self.last_position_integral_update_sec is None:
                 self.last_position_integral_update_sec = float(now_sec)
             else:
-                dt = float(now_sec) - self.last_position_integral_update_sec
+                dt = (
+                    float(now_sec)
+                    - self.last_position_integral_update_sec
+                )
                 self.last_position_integral_update_sec = float(now_sec)
                 if math.isfinite(dt) and dt > 0.0:
                     dt = min(dt, self.position_integral_max_dt_s)
-                    self.position_integral_error_world += (
-                        position_error_world * dt
+                    self.position_integral_error_world[0:2] += (
+                        line_normal_world[0:2]
+                        * cross_track_error_m
+                        * dt
                     )
+                    self.position_integral_error_world[2] += (
+                        depth_error_m * dt
+                    )
+                    MPCTrackTrajectoryAcados._project_position_integral_to_fixed_hook_normal(self)
+        else:
+            if prehook_fault_hold_active:
+                position_reference_world = np.asarray(
+                    self._prehook_planner_hold_pos,
+                    dtype=float,
+                )
+            else:
+                position_reference_world = self._goal_position()
+            position_error_world = position_reference_world - self.p_w
+            error_norm = float(np.linalg.norm(position_error_world))
+            if not np.all(np.isfinite(position_error_world)):
+                # A non-finite reference/state cannot be compensated safely.
+                self._reset_position_integral()
+                return base_force
+            if error_norm > self.position_integral_activation_error_m:
+                if not prehook_fault_hold_active:
+                    # A large error is more likely a bad reference,
+                    # obstruction, or frame problem. Do not let the integral
+                    # mask it during normal motion.
+                    self._reset_position_integral()
+                    return base_force
+                # A fault hold is already motion-latched and its vertical
+                # term is the learned positive-buoyancy support. Freeze that
+                # bounded term rather than silently deleting it after a large
+                # displacement; discard XY and wait for the operator to
+                # DISARM. The normal total-force limits below still apply.
+                self._clear_position_integral_xy_preserve_z()
+            else:
+                if self.last_position_integral_update_sec is None:
+                    self.last_position_integral_update_sec = float(now_sec)
+                else:
+                    dt = (
+                        float(now_sec)
+                        - self.last_position_integral_update_sec
+                    )
+                    self.last_position_integral_update_sec = float(now_sec)
+                    if math.isfinite(dt) and dt > 0.0:
+                        dt = min(dt, self.position_integral_max_dt_s)
+                        self.position_integral_error_world += (
+                            position_error_world * dt
+                        )
 
         rotation_body_to_world = quat_to_rotation_matrix_wxyz(
             self.q_wxyz
@@ -1731,6 +2635,10 @@ class MPCTrackTrajectoryAcados(Node):
         self.position_integral_error_world[:] = (
             rotation_body_to_world @ delivered_bias_body
         ) / gain
+        if fixed_hook_transit:
+            # Per-axis body-force clipping can introduce a tiny numerical
+            # along-line component during anti-windup back-calculation.
+            MPCTrackTrajectoryAcados._project_position_integral_to_fixed_hook_normal(self)
         return combined_force
 
     def _invalidate_command(self, reset_trajectory, publish_zero):
@@ -1743,7 +2651,30 @@ class MPCTrackTrajectoryAcados(Node):
             self.terminal_hold_goal_signature = None
             self._trajectory_reset_pending = True
             self.fixed_hook_projected_restart = False
-            self._reset_position_integral()
+            if bool(getattr(
+                self,
+                "_prehook_attitude_fault_latched",
+                False,
+            )):
+                # Command/odometry invalidation may require zero wrench, but
+                # recovery into the still-latched current-pose hold must not
+                # repeat the heave-force step that caused the 2026-08-26
+                # positive-buoyancy rise.
+                self._clear_position_integral_xy_preserve_z()
+            else:
+                self._reset_position_integral()
+            clear_hook_confirmation = getattr(
+                self,
+                "_clear_operator_hook_confirmation",
+                None,
+            )
+            if clear_hook_confirmation is not None:
+                clear_hook_confirmation()
+            reset_planner = getattr(
+                self, "_reset_dynamic_prehook_runtime", None
+            )
+            if reset_planner is not None:
+                reset_planner()
         if publish_zero:
             self.publish_zero()
 
@@ -1754,6 +2685,34 @@ class MPCTrackTrajectoryAcados(Node):
         self.forward_pass_start_pos = None
         self.forward_pass_start_time_sec = 0.0
         self.fixed_hook_projected_restart = False
+        dynamic_prehook = bool(
+            getattr(
+                self,
+                "_dynamic_prehook_planner_enabled",
+                lambda: False,
+            )()
+        )
+        if (
+            dynamic_prehook
+            and getattr(self, "_prehook_attitude_fault_latched", False)
+        ):
+            # Preserve the captured hold across a transient command-cache
+            # reset. Resuming PLAN here would bypass the fault latch without
+            # the required operator mission-false acknowledgement.
+            self.mission_state = "TRACK_TO_PREHOOK"
+            self.active_goal_pos = self._pre_approach_position()
+            self.active_goal_yaw = self._goal_yaw_static()
+            self._prehook_planner_hold_active = True
+            self.x_guess[:, :] = x0.reshape(1, -1)
+            self.u_guess[:, :] = 0.0
+            self._trajectory_reset_pending = False
+            self.get_logger().warning(
+                "Pre-hook attitude fault hold preserved after command "
+                "reset; motion remains latched until explicit mission false."
+            )
+            return True
+        if dynamic_prehook:
+            self._reset_dynamic_prehook_runtime()
 
         if bool(self.get_parameter("use_box_recovery_mission").value):
             self.mission_state = "INIT"
@@ -1762,7 +2721,10 @@ class MPCTrackTrajectoryAcados(Node):
             self.home_yaw = 0.0
         else:
             if self._pre_approach_waypoint_enabled():
-                self.mission_state = "PRE_APPROACH"
+                if dynamic_prehook:
+                    self.mission_state = "PLAN_TO_PREHOOK"
+                else:
+                    self.mission_state = "PRE_APPROACH"
                 self.active_goal_pos = self._pre_approach_position()
             else:
                 self.active_goal_pos = self._goal_position_static()
@@ -1814,7 +2776,13 @@ class MPCTrackTrajectoryAcados(Node):
             )
             return False
 
-        self._reset_trajectory_from_current_pose()
+        if dynamic_prehook:
+            if not self._plan_to_prehook_from_current(
+                reason="initial mission entry"
+            ):
+                return False
+        else:
+            self._reset_trajectory_from_current_pose()
 
         # Do not let a warm start from a previous enable period influence the
         # first solve of a new operator-approved run.
@@ -1825,25 +2793,31 @@ class MPCTrackTrajectoryAcados(Node):
 
     def _phase_traj_speed(self):
         if (
-            self.mission_state == "PRE_APPROACH"
+            self.mission_state
+            in (
+                "PLAN_TO_PREHOOK",
+                "TRACK_TO_PREHOOK",
+                "PREHOOK_REACHED",
+                "PRE_APPROACH",
+            )
             and self.pre_approach_speed_mps > 0.0
         ):
             return self.pre_approach_speed_mps
         if (
-            self.mission_state == "FINAL_APPROACH"
+            self.mission_state in ("FINAL_APPROACH", "GO_FORWARD")
             and self.final_approach_speed_mps > 0.0
         ):
             return self.final_approach_speed_mps
         if self.mission_state == "FORWARD_PASS":
             return float(self.get_parameter("forward_pass_speed_mps").value)
-        if self.mission_state in ("BACKWARD_PASS", "RETREAT"):
+        if self.mission_state in ("BACKWARD_PASS", "RETREAT", "GO_BACK"):
             return float(self.get_parameter("backward_pass_speed_mps").value)
         return float(self.get_parameter("traj_speed_mps").value)
 
     def _fixed_hook_transit_active(self):
         return (
             getattr(self, "mission_state", "")
-            in ("FINAL_APPROACH", "RETREAT")
+            in ("FINAL_APPROACH", "GO_FORWARD", "RETREAT", "GO_BACK")
             and not bool(
                 self.get_parameter("use_box_recovery_mission").value
             )
@@ -1854,11 +2828,646 @@ class MPCTrackTrajectoryAcados(Node):
         mode = str(self.get_parameter("planner_mode").value).strip().lower()
         if mode != "astar":
             return False
+        if (
+            getattr(
+                self,
+                "_dynamic_prehook_planner_enabled",
+                lambda: False,
+            )()
+            and self.mission_state
+            in ("PLAN_TO_PREHOOK", "TRACK_TO_PREHOOK")
+        ):
+            return True
         if self.mission_state == "ALIGN":
             return bool(self.get_parameter("planner_use_for_align").value)
         if self.mission_state == "RETURN_SHORE":
             return bool(self.get_parameter("planner_use_for_return").value)
         return False
+
+    def _real_prehook_planner_grid(self):
+        """Return the static real-NED grid used only before pre-hook."""
+        if self._prehook_planner_grid_cache is not None:
+            return self._prehook_planner_grid_cache
+        if not self.operating_bounds_enabled:
+            raise ValueError(
+                "real pre-hook A* requires operating_bounds_enable=true"
+            )
+
+        bounds = (
+            float(self.operating_bounds_min_ned[0]),
+            float(self.operating_bounds_max_ned[0]),
+            float(self.operating_bounds_min_ned[1]),
+            float(self.operating_bounds_max_ned[1]),
+        )
+        # The launch has already converted the raw 9 x 5 x 3 m pool and
+        # removed its safety margin.  These are therefore centre-feasible
+        # bounds and must not be shrunk a second time here.
+        inflation = (
+            float(self.get_parameter("astar_robot_radius").value)
+            + float(self.get_parameter("astar_obstacle_margin").value)
+        )
+        raw_obstacles = _parse_static_obstacle_rectangles(
+            self.get_parameter(
+                "prehook_static_obstacles_ned_xyxy"
+            ).value
+        )
+        obstacles = [
+            planner_inflate_rect(rectangle, inflation)
+            for rectangle in raw_obstacles
+        ]
+        self._prehook_planner_grid_cache = PlannerOccupancyGrid2D(
+            bounds=bounds,
+            resolution=float(self.get_parameter("astar_resolution").value),
+            obstacles=obstacles,
+        )
+        return self._prehook_planner_grid_cache
+
+    def _activate_prehook_planner_hold(
+        self,
+        *,
+        preserve_vertical_integral=False,
+    ):
+        """Capture a fixed pose reference for planning or a fault hold."""
+        if not self._prehook_planner_hold_active:
+            self._prehook_planner_hold_pos = np.asarray(
+                self.p_w, dtype=float
+            ).copy()
+            self._prehook_planner_hold_q_wxyz = np.asarray(
+                self.q_wxyz, dtype=float
+            ).copy()
+        self._prehook_planner_hold_active = True
+        if preserve_vertical_integral:
+            # The real vehicles are positively buoyant. Switching from the
+            # settled pre-hook reference to a fault hold must not remove the
+            # already delivered world-Z heave bias in one control tick. XY
+            # bias belongs to the old waypoint and is intentionally dropped.
+            self._clear_position_integral_xy_preserve_z()
+        else:
+            self._reset_position_integral()
+
+    def _submit_prehook_plan_request(
+        self,
+        *,
+        reason,
+        request_level,
+        status=None,
+    ):
+        """Submit one immutable real-NED A* snapshot to the worker."""
+        if request_level not in ("initial", "mandatory", "optional"):
+            raise ValueError(
+                f"invalid pre-hook planner request level {request_level!r}"
+            )
+        if self._prehook_replan_future is not None:
+            return False
+        executor = self._prehook_replan_executor
+        if executor is None:
+            raise RuntimeError("Dynamic pre-hook A* worker is unavailable")
+
+        grid = self._real_prehook_planner_grid()
+        start_xy = (float(self.p_w[0]), float(self.p_w[1]))
+        goal_xy = (
+            float(self.active_goal_pos[0]),
+            float(self.active_goal_pos[1]),
+        )
+        old_cost = None
+        if status is not None:
+            old_cost = float(status["remaining_cost_m"])
+        self._prehook_replan_context = {
+            "generation": self._prehook_plan_generation,
+            "goal_signature": self._goal_signature(),
+            "reason": str(reason),
+            "request_level": request_level,
+            "old_remaining_cost_m": old_cost,
+        }
+        self._prehook_replan_future = executor.submit(
+            plan_real_xy_path,
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+            bounds=grid.bounds,
+            obstacles=tuple(grid.obstacles),
+            resolution=grid.resolution,
+            diagonal_motion=bool(
+                self.get_parameter("astar_diagonal_motion").value
+            ),
+            smoothing_iterations=int(
+                self.get_parameter(
+                    "prehook_path_smoothing_iterations"
+                ).value
+            ),
+            smoothing_corner_fraction=float(
+                self.get_parameter(
+                    "prehook_path_smoothing_corner_fraction"
+                ).value
+            ),
+            smoothing_samples_per_corner=int(
+                self.get_parameter(
+                    "prehook_path_smoothing_samples_per_corner"
+                ).value
+            ),
+        )
+        self._prehook_last_optimization_monotonic = time.monotonic()
+        self.get_logger().info(
+            "Pre-hook planner submitted background A*: "
+            f"level={request_level}, reason={reason}."
+        )
+        return True
+
+    def _plan_to_prehook_from_current(self, reason):
+        """Enter PLAN and submit its mandatory A* work in the background."""
+        self.mission_state = "PLAN_TO_PREHOOK"
+        self.state_enter_time_sec = self._now_sec()
+        self.active_goal_pos = self._pre_approach_position()
+        self.active_goal_yaw = self._goal_yaw_static()
+        self._capture_prehook_trim_if_needed()
+        self._reset_dynamic_prehook_runtime()
+        self._activate_prehook_planner_hold()
+        self.get_logger().info(
+            "Mission -> PLAN_TO_PREHOOK: read current EKF/MoCap pose "
+            f"{self.p_w.tolist()} ({reason}); holding this pose while the "
+            "background A* worker plans."
+        )
+        try:
+            submitted = self._submit_prehook_plan_request(
+                reason=reason,
+                request_level="initial",
+            )
+        except Exception as exc:
+            self._revoke_mission_enable(
+                "PLAN_TO_PREHOOK failed closed; no linear fallback: "
+                f"{type(exc).__name__}: {exc}."
+            )
+            return False
+        if submitted:
+            return True
+        if self._prehook_replan_future is not None:
+            self.get_logger().info(
+                "PLAN_TO_PREHOOK is waiting for a stale in-flight A* job "
+                "to finish before submitting the current pose snapshot."
+            )
+            return True
+        return False
+
+    def _prehook_path_status(self):
+        grid = self._real_prehook_planner_grid()
+        path_xy = [
+            (float(point[0]), float(point[1]))
+            for point in self.path_points
+        ]
+        if len(path_xy) < 2:
+            raise RuntimeError("TRACK_TO_PREHOOK has no usable path")
+        projection = project_point_to_path(
+            (float(self.p_w[0]), float(self.p_w[1])),
+            path_xy,
+            minimum_progress_m=float(self._prehook_path_progress_m),
+        )
+        self._prehook_path_progress_m = max(
+            float(self._prehook_path_progress_m),
+            float(projection.progress_m),
+        )
+        remaining = remaining_path_from_projection(path_xy, projection)
+        current = (float(self.p_w[0]), float(self.p_w[1]))
+        route_from_current = [current]
+        for point in remaining:
+            if math.hypot(
+                point[0] - route_from_current[-1][0],
+                point[1] - route_from_current[-1][1],
+            ) > 1e-9:
+                route_from_current.append(point)
+        route_safe = planner_path_is_free(route_from_current, grid)
+        remaining_cost = float(projection.cross_track_m) + float(
+            projection.remaining_length_m
+        )
+        return {
+            "safe": route_safe,
+            "cross_track_m": float(projection.cross_track_m),
+            "remaining_cost_m": remaining_cost,
+            "route_xy": route_from_current,
+        }
+
+    def _submit_prehook_replan_if_needed(
+        self,
+        *,
+        suppress_optional_improvement=False,
+    ):
+        if self.mission_state != "TRACK_TO_PREHOOK":
+            return
+
+        now_monotonic = time.monotonic()
+        rate_hz = float(
+            self.get_parameter("prehook_planner_check_rate_hz").value
+        )
+        if (
+            self._prehook_last_check_monotonic is not None
+            and now_monotonic - self._prehook_last_check_monotonic
+            < 1.0 / rate_hz
+        ):
+            return
+        self._prehook_last_check_monotonic = now_monotonic
+
+        try:
+            status = self._prehook_path_status()
+        except Exception as exc:
+            self._revoke_mission_enable(
+                "Pre-hook path validation failed: "
+                f"{type(exc).__name__}: {exc}."
+            )
+            return
+
+        deviation_threshold = float(
+            self.get_parameter("prehook_replan_deviation_m").value
+        )
+        if status["cross_track_m"] > deviation_threshold:
+            if self._prehook_deviation_since_monotonic is None:
+                self._prehook_deviation_since_monotonic = now_monotonic
+        else:
+            self._prehook_deviation_since_monotonic = None
+
+        if not status["safe"]:
+            # Safety validation must continue at the configured 2--5 Hz even
+            # while an optional A* job is already running.  Freeze now; an
+            # optional result is never promoted into the mandatory repair.
+            self._activate_prehook_planner_hold()
+            future = self._prehook_replan_future
+            context = self._prehook_replan_context
+            if future is not None:
+                request_level = (
+                    None if context is None
+                    else context.get("request_level")
+                )
+                if request_level == "optional":
+                    self._prehook_mandatory_replan_pending = True
+                    if future.cancel():
+                        self._prehook_replan_future = None
+                        self._prehook_replan_context = None
+                    else:
+                        self.get_logger().warning(
+                            "Remaining pre-hook path became unsafe while an "
+                            "optional A* job was running; holding pose and "
+                            "waiting to submit a distinct mandatory repair."
+                        )
+                        return
+                else:
+                    return
+
+            try:
+                submitted = self._submit_prehook_plan_request(
+                    reason="unsafe_remaining_path",
+                    request_level="mandatory",
+                    status=status,
+                )
+            except Exception as exc:
+                self._revoke_mission_enable(
+                    "Required pre-hook replan could not be submitted: "
+                    f"{type(exc).__name__}: {exc}."
+                )
+                return
+            if submitted:
+                self._prehook_mandatory_replan_pending = False
+            return
+
+        if self._prehook_mandatory_replan_pending:
+            if self._prehook_replan_future is not None:
+                return
+            try:
+                submitted = self._submit_prehook_plan_request(
+                    reason="queued_unsafe_path_repair",
+                    request_level="mandatory",
+                    status=status,
+                )
+            except Exception as exc:
+                self._revoke_mission_enable(
+                    "Queued mandatory pre-hook replan could not be "
+                    f"submitted: {type(exc).__name__}: {exc}."
+                )
+                return
+            if submitted:
+                self._prehook_mandatory_replan_pending = False
+            return
+
+        # Once translation is inside the pre-hook gate, another optional
+        # path cannot solve an attitude-only residual.  The route safety
+        # check and both mandatory-repair branches above deliberately remain
+        # active; only optional deviation/optimization requests stop here.
+        if suppress_optional_improvement:
+            return
+
+        deviation_persistent = (
+            self._prehook_deviation_since_monotonic is not None
+            and now_monotonic - self._prehook_deviation_since_monotonic
+            >= float(
+                self.get_parameter(
+                    "prehook_replan_deviation_hold_s"
+                ).value
+            )
+        )
+        optimization_period = float(
+            self.get_parameter(
+                "prehook_replan_optimization_period_s"
+            ).value
+        )
+        optimization_due = (
+            optimization_period > 0.0
+            and (
+                self._prehook_last_optimization_monotonic is None
+                or now_monotonic
+                - self._prehook_last_optimization_monotonic
+                >= optimization_period
+            )
+        )
+
+        if deviation_persistent:
+            reason = "persistent_cross_track_deviation"
+        elif optimization_due:
+            reason = "candidate_path_improvement_check"
+        else:
+            return
+
+        # The current route was still checked above.  A running job merely
+        # prevents another optional submission; it must not suppress checks.
+        if self._prehook_replan_future is not None:
+            return
+
+        min_switch_interval = float(
+            self.get_parameter(
+                "prehook_replan_min_switch_interval_s"
+            ).value
+        )
+        cooldown_origins = [
+            value
+            for value in (
+                self._prehook_last_switch_monotonic,
+                self._prehook_last_optimization_monotonic,
+            )
+            if value is not None
+        ]
+        if (
+            cooldown_origins
+            and now_monotonic - max(cooldown_origins)
+            < min_switch_interval
+        ):
+            return
+
+        try:
+            self._submit_prehook_plan_request(
+                reason=reason,
+                request_level="optional",
+                status=status,
+            )
+        except Exception as exc:
+            self.get_logger().warning(
+                "Optional pre-hook A* could not be submitted; retaining "
+                f"the validated route: {type(exc).__name__}: {exc}."
+            )
+
+    def _candidate_path_from_current(self, candidate_path):
+        grid = self._real_prehook_planner_grid()
+        current = (float(self.p_w[0]), float(self.p_w[1]))
+        projection = project_point_to_path(current, candidate_path)
+        remaining = remaining_path_from_projection(
+            candidate_path, projection
+        )
+        anchored = [current]
+        for point in remaining:
+            point = (float(point[0]), float(point[1]))
+            if math.hypot(
+                point[0] - anchored[-1][0],
+                point[1] - anchored[-1][1],
+            ) > 1e-9:
+                anchored.append(point)
+        goal = (
+            float(self.active_goal_pos[0]),
+            float(self.active_goal_pos[1]),
+        )
+        if math.hypot(
+            anchored[-1][0] - goal[0], anchored[-1][1] - goal[1]
+        ) > 1e-9:
+            anchored.append(goal)
+        else:
+            anchored[-1] = goal
+        if len(anchored) == 1:
+            anchored.append(goal)
+        if not planner_path_is_free(anchored, grid):
+            raise RuntimeError(
+                "completed A* candidate cannot be safely joined from the "
+                "latest vehicle pose"
+            )
+        return anchored
+
+    def _poll_prehook_replan(
+        self,
+        *,
+        suppress_optional_improvement=False,
+    ):
+        future = self._prehook_replan_future
+        if future is None:
+            return
+        context = self._prehook_replan_context
+        request_level = (
+            None if context is None
+            else context.get("request_level", "optional")
+        )
+        if (
+            request_level == "optional"
+            and suppress_optional_improvement
+            and not self._prehook_mandatory_replan_pending
+            and not future.done()
+        ):
+            # A running optional search is no longer useful once only
+            # attitude remains. Cancel it when possible; otherwise its result
+            # will be discarded below while the alignment condition holds.
+            if future.cancel():
+                self._prehook_replan_future = None
+                self._prehook_replan_context = None
+            return
+        if not future.done():
+            return
+        self._prehook_replan_future = None
+        self._prehook_replan_context = None
+
+        expected_state = (
+            "PLAN_TO_PREHOOK"
+            if request_level == "initial"
+            else "TRACK_TO_PREHOOK"
+        )
+        stale = (
+            context is None
+            or context["generation"] != self._prehook_plan_generation
+            or self.mission_state != expected_state
+            or context["goal_signature"] != self._goal_signature()
+        )
+        if stale:
+            if self.mission_state not in (
+                "PLAN_TO_PREHOOK",
+                "TRACK_TO_PREHOOK",
+            ):
+                self._prehook_planner_hold_active = False
+            return
+
+        def submit_mandatory_after_optional(reason):
+            self._activate_prehook_planner_hold()
+            self._prehook_mandatory_replan_pending = True
+            try:
+                status = self._prehook_path_status()
+            except Exception:
+                status = None
+            try:
+                submitted = self._submit_prehook_plan_request(
+                    reason=reason,
+                    request_level="mandatory",
+                    status=status,
+                )
+            except Exception as exc:
+                self._revoke_mission_enable(
+                    "Required pre-hook replan could not be submitted after "
+                    f"an unsafe route: {type(exc).__name__}: {exc}."
+                )
+                return
+            if submitted:
+                self._prehook_mandatory_replan_pending = False
+
+        if (
+            request_level == "optional"
+            and self._prehook_mandatory_replan_pending
+        ):
+            # The route became unsafe while this job was running.  Its result
+            # belongs to an optional request snapshot, so discard it without
+            # inspecting/accepting it and launch a distinct mandatory repair.
+            submit_mandatory_after_optional(
+                "unsafe_path_after_optional_request"
+            )
+            return
+
+        if (
+            request_level == "optional"
+            and suppress_optional_improvement
+        ):
+            self.get_logger().info(
+                "Completed optional pre-hook A* candidate discarded: "
+                "translation is already inside tolerance and only attitude "
+                "alignment remains."
+            )
+            return
+
+        try:
+            candidate_path, _candidate_grid = future.result()
+            candidate_path = self._candidate_path_from_current(
+                candidate_path
+            )
+            candidate_cost = planner_path_length(candidate_path)
+        except Exception as exc:
+            if request_level == "initial":
+                self._revoke_mission_enable(
+                    "PLAN_TO_PREHOOK failed closed; no linear fallback: "
+                    f"{type(exc).__name__}: {exc}."
+                )
+                return
+            if request_level == "mandatory":
+                self._revoke_mission_enable(
+                    "Required pre-hook replan failed closed: "
+                    f"{type(exc).__name__}: {exc}."
+                )
+                return
+
+            try:
+                current_safe = self._prehook_path_status()["safe"]
+            except Exception:
+                current_safe = False
+            if current_safe:
+                self.get_logger().warning(
+                    "Optional pre-hook A* candidate failed; keeping the "
+                    f"validated current path: {type(exc).__name__}: {exc}."
+                )
+            else:
+                submit_mandatory_after_optional(
+                    "optional_failure_with_unsafe_route"
+                )
+            return
+
+        if request_level == "initial":
+            self._set_path_trajectory(
+                candidate_path,
+                self.active_goal_pos[2],
+                start_z=float(self.p_w[2]),
+            )
+            now_monotonic = time.monotonic()
+            self.mission_state = "TRACK_TO_PREHOOK"
+            self.state_enter_time_sec = self._now_sec()
+            self._prehook_path_progress_m = 0.0
+            self._prehook_deviation_since_monotonic = None
+            self._prehook_last_check_monotonic = now_monotonic
+            self._prehook_last_switch_monotonic = now_monotonic
+            self._prehook_last_optimization_monotonic = now_monotonic
+            self._prehook_mandatory_replan_pending = False
+            self._prehook_planner_hold_active = False
+            self.get_logger().info(
+                "Mission -> TRACK_TO_PREHOOK: background A* path "
+                f"installed ({len(candidate_path)} XY points). NMPC remains "
+                f"at {float(self.get_parameter('solve_rate_hz').value):.1f} "
+                "Hz."
+            )
+            return
+
+        try:
+            current_status = self._prehook_path_status()
+        except Exception as exc:
+            if request_level == "mandatory":
+                current_status = {
+                    "safe": False,
+                    "remaining_cost_m": float("inf"),
+                }
+            else:
+                submit_mandatory_after_optional(
+                    "optional_completion_path_validation_failure"
+                )
+                return
+
+        if request_level == "optional" and not current_status["safe"]:
+            submit_mandatory_after_optional(
+                "unsafe_path_at_optional_completion"
+            )
+            return
+
+        old_cost = current_status["remaining_cost_m"]
+        improvement = old_cost - candidate_cost
+        required_improvement = max(
+            float(
+                self.get_parameter(
+                    "prehook_replan_min_improvement_m"
+                ).value
+            ),
+            float(
+                self.get_parameter(
+                    "prehook_replan_min_improvement_ratio"
+                ).value
+            ) * old_cost,
+        )
+        mandatory = request_level == "mandatory"
+        accept = mandatory or improvement >= required_improvement
+
+        if not accept:
+            self._prehook_planner_hold_active = False
+            self.get_logger().info(
+                "Pre-hook A* candidate rejected without resetting NMPC "
+                f"reference: improvement={improvement:.3f}m, required="
+                f"{required_improvement:.3f}m."
+            )
+            return
+
+        self._set_path_trajectory(
+            candidate_path,
+            self.active_goal_pos[2],
+            start_z=float(self.p_w[2]),
+        )
+        self._prehook_path_progress_m = 0.0
+        self._prehook_deviation_since_monotonic = None
+        self._prehook_last_switch_monotonic = time.monotonic()
+        self._prehook_mandatory_replan_pending = False
+        self._prehook_planner_hold_active = False
+        self.get_logger().info(
+            "TRACK_TO_PREHOOK path atomically replaced: "
+            f"reason={context['reason']}, old={old_cost:.3f}m, "
+            f"new={candidate_cost:.3f}m."
+        )
 
     def _load_planner_geometry(self):
         if self._planner_geometry_cache is not None:
@@ -1926,7 +3535,8 @@ class MPCTrackTrajectoryAcados(Node):
                 raise ValueError(
                     "fixed-hook pre-approach and hook poses must be distinct"
                 )
-            if self.fixed_hook_projected_restart:
+            projected_restart = bool(self.fixed_hook_projected_restart)
+            if projected_restart:
                 # If FINAL_HOLD drifted just outside tolerance, recover from
                 # the closest point instead of replaying the entire line.
                 progress = clamp(
@@ -1942,16 +3552,51 @@ class MPCTrackTrajectoryAcados(Node):
                 self.traj_start_pos = line_start.copy()
             self.fixed_hook_projected_restart = False
             self.traj_goal_pos = line_goal.copy()
-            # PRE_APPROACH already requires the recorded attitude.  Keep that
-            # attitude fixed for both the forward and reverse straight line.
-            self.traj_start_q_wxyz = np.asarray(
-                self._goal_quaternion(),
-                dtype=float,
-            ).copy()
-            # Carry only the learned world-Z compensation into horizontal
-            # transit.  Cross-track XY bias belongs to the previous waypoint
-            # and must not steer the nominal straight line.
-            self.position_integral_error_world[0:2] = 0.0
+            if (
+                self.mission_state == "GO_FORWARD"
+                and self._prehook_attitude_reference_mode()
+                == "capture_start_trim"
+            ):
+                if projected_restart:
+                    # A legacy automatic FINAL_HOLD restart can begin close
+                    # to the Hook pose, where the vehicle already carries
+                    # most or all of the recorded Hook attitude. Returning
+                    # its reference to the mission-start trim would introduce
+                    # a discontinuous attitude command and can create lateral
+                    # motion beside the handle. Restart from the measured
+                    # attitude; the remaining segment still converges to the
+                    # recorded Hook attitude through the normal SLERP.
+                    self.traj_start_q_wxyz = np.asarray(
+                        self.q_wxyz,
+                        dtype=float,
+                    ).copy()
+                else:
+                    trim = getattr(self, "_prehook_trim_q_wxyz", None)
+                    self.traj_start_q_wxyz = np.asarray(
+                        self.q_wxyz if trim is None else trim,
+                        dtype=float,
+                    ).copy()
+            else:
+                # Compatibility mode starts at the recorded Hook attitude;
+                # GO_BACK also keeps that attitude fixed throughout.
+                self.traj_start_q_wxyz = np.asarray(
+                    self._goal_quaternion(),
+                    dtype=float,
+                ).copy()
+            # Carry the learned world-Z and line-normal cross-current
+            # compensation into horizontal transit. Discard the along-line
+            # component so the time reference or compatibility governor is
+            # the sole source of forward/back advancement.
+            if bool(self.get_parameter(
+                "fixed_hook_line_position_mode"
+            ).value):
+                # Position-like translation keeps any learned downward hover
+                # support, but must not inherit an upward bias from the instant
+                # at which the pre-hook depth gate was crossed.
+                MPCTrackTrajectoryAcados._discard_upward_world_z_integral(
+                    self
+                )
+            MPCTrackTrajectoryAcados._project_position_integral_to_fixed_hook_normal(self)
             self.last_position_integral_update_sec = None
         self.traj_start_time_sec = self._now_sec()
         dist = float(np.linalg.norm(self.traj_goal_pos - self.traj_start_pos))
@@ -1977,7 +3622,14 @@ class MPCTrackTrajectoryAcados(Node):
             min_duration,
         )
         self.traj_active = True
-        self.traj_kind = "linear"
+        self.traj_kind = (
+            "fixed_hook_line" if fixed_hook_line is not None else "linear"
+        )
+        self._fixed_hook_line_progress_m = 0.0
+        self._fixed_hook_line_actual_progress_m = 0.0
+        self._fixed_hook_line_raw_progress_m = 0.0
+        self._fixed_hook_line_interlock_active = False
+        self._fixed_hook_line_interlock_reason = ""
         self.path_points = []
         self.path_segment_lengths = []
         self.path_total_length = 0.0
@@ -1986,6 +3638,18 @@ class MPCTrackTrajectoryAcados(Node):
         self.get_logger().info(
             f"New linear trajectory: start={self.traj_start_pos}, goal={self.traj_goal_pos}, duration={self.traj_duration_sec:.2f}s"
         )
+        if (
+            self.traj_kind == "fixed_hook_line"
+            and bool(self.get_parameter(
+                "fixed_hook_line_position_mode"
+            ).value)
+        ):
+            self.get_logger().info(
+                "Fixed-hook Position-like translation active: the NED "
+                "reference advances monotonically to the endpoint with "
+                "constant depth and zero depth-velocity reference; ordinary "
+                "corridor error will not freeze, brake, or rewind it."
+            )
 
     def _fixed_hook_line_segment(self):
         """Return the nominal level segment for final approach or retreat."""
@@ -2034,23 +3698,386 @@ class MPCTrackTrajectoryAcados(Node):
                 "recorded body-forward yaw"
             )
 
-        if self.mission_state == "FINAL_APPROACH":
+        if self.mission_state in ("FINAL_APPROACH", "GO_FORWARD"):
             return pre_approach, hook
         return hook, pre_approach
 
-    def _set_path_trajectory(self, path_xy, goal_z):
-        if len(path_xy) < 2:
-            raise ValueError("A* path trajectory requires at least two points")
+    def _fixed_hook_line_governor_active(self):
+        """Return whether the real Hook corridor progress governor is live."""
+        return (
+            bool(getattr(self, "traj_active", False))
+            and getattr(self, "traj_kind", "") == "fixed_hook_line"
+            and getattr(self, "mission_state", "")
+            in ("GO_FORWARD", "GO_BACK")
+            and not bool(
+                self.get_parameter(
+                    "fixed_hook_line_position_mode"
+                ).value
+            )
+        )
+
+    def _fixed_hook_line_position_mode_active(self):
+        """Return whether continuous Position-like Hook translation is live."""
+        return (
+            bool(getattr(self, "traj_active", False))
+            and getattr(self, "traj_kind", "") == "fixed_hook_line"
+            and getattr(self, "mission_state", "")
+            in ("GO_FORWARD", "GO_BACK")
+            and bool(
+                self.get_parameter(
+                    "fixed_hook_line_position_mode"
+                ).value
+            )
+        )
+
+    def _fixed_hook_line_governor_status(self):
+        """Project the latest pose onto the active level Hook corridor."""
+        line_start = np.asarray(self.traj_start_pos, dtype=float)
+        line_goal = np.asarray(self.traj_goal_pos, dtype=float)
+        line_delta = line_goal - line_start
+        line_length = float(np.linalg.norm(line_delta[0:2]))
+        if line_length <= 1e-9:
+            line_unit = np.zeros(3, dtype=float)
+            projection = line_goal.copy()
+            line_projection = line_goal.copy()
+            signed_progress_m = 0.0
+            raw_progress_m = 0.0
+        else:
+            line_unit = line_delta / line_length
+            signed_progress_m = float(np.dot(
+                self.p_w - line_start,
+                line_unit,
+            ))
+            raw_progress_m = clamp(
+                signed_progress_m,
+                0.0,
+                line_length,
+            )
+            projection = line_start + raw_progress_m * line_unit
+            # Cross-track is distance to the infinite corridor centreline,
+            # not distance to the clamped segment endpoint.  A vehicle pushed
+            # directly behind pre-hook is an along-track error and must not be
+            # misclassified as a lateral corridor breach.
+            line_projection = (
+                line_start + signed_progress_m * line_unit
+            )
+        # The configured endpoints are level.  Pin the projection explicitly
+        # so no odometry heave can leak into the forward/back reference.
+        projection[2] = line_start[2]
+        line_projection[2] = line_start[2]
+        cross_track_m = float(np.linalg.norm(
+            np.asarray(self.p_w[0:2], dtype=float)
+            - line_projection[0:2]
+        ))
+        depth_error_m = abs(float(self.p_w[2] - line_start[2]))
+        yaw_error_rad = abs(wrap_pi(
+            quat_to_yaw_wxyz(self.q_wxyz) - self._goal_yaw_static()
+        ))
+        return {
+            "line_start": line_start,
+            "line_goal": line_goal,
+            "line_delta": line_delta,
+            "line_unit": line_unit,
+            "line_length_m": line_length,
+            "signed_progress_m": signed_progress_m,
+            "raw_progress_m": raw_progress_m,
+            "projection": projection,
+            "line_projection": line_projection,
+            "cross_track_m": cross_track_m,
+            "depth_error_m": depth_error_m,
+            "yaw_error_rad": yaw_error_rad,
+        }
+
+    def _update_fixed_hook_line_governor(self):
+        """Update the no-retreat measured-progress anchor once per solve."""
+        if not self._fixed_hook_line_governor_active():
+            return None
+
+        status = self._fixed_hook_line_governor_status()
+        self._fixed_hook_line_raw_progress_m = status["raw_progress_m"]
+        # Progress is monotonic in this phase's configured direction even on
+        # a tick that enters or remains in the corridor interlock.  The
+        # interlock may remove new forward lead, but it must never move the
+        # position target back toward the phase start.  Capturing the furthest
+        # measured station also prevents a small inertial overshoot from
+        # being followed by an intentional reverse command.
+        furthest_measured_progress_m = min(
+            status["line_length_m"],
+            max(
+                float(getattr(
+                    self,
+                    "_fixed_hook_line_actual_progress_m",
+                    0.0,
+                )),
+                status["raw_progress_m"],
+            ),
+        )
+        self._fixed_hook_line_actual_progress_m = (
+            furthest_measured_progress_m
+        )
+        self._fixed_hook_line_progress_m = max(
+            float(getattr(self, "_fixed_hook_line_progress_m", 0.0)),
+            furthest_measured_progress_m,
+        )
+        cross_track_tolerance_m = float(
+            self.get_parameter(
+                "fixed_hook_line_cross_track_tol_m"
+            ).value
+        )
+        yaw_tolerance_rad = float(
+            self.get_parameter("fixed_hook_line_yaw_tol_rad").value
+        )
+        was_interlocked = bool(
+            getattr(self, "_fixed_hook_line_interlock_active", False)
+        )
+        release_ratio = float(self.get_parameter(
+            "fixed_hook_line_interlock_release_ratio"
+        ).value)
+        active_ratio = release_ratio if was_interlocked else 1.0
+        active_cross_track_tolerance_m = (
+            cross_track_tolerance_m * active_ratio
+        )
+        active_yaw_tolerance_rad = yaw_tolerance_rad * active_ratio
+        threshold_kind = "release" if was_interlocked else "entry"
+
+        reasons = []
+        if (
+            status["cross_track_m"]
+            > active_cross_track_tolerance_m
+        ):
+            reasons.append(
+                "cross-track "
+                f"{status['cross_track_m']:.3f}m > "
+                f"{active_cross_track_tolerance_m:.3f}m "
+                f"({threshold_kind})"
+            )
+        depth_tolerance_m = max(
+            float(getattr(self, "fixed_hook_depth_tolerance_m", 0.0)),
+            0.0,
+        )
+        active_depth_tolerance_m = depth_tolerance_m * active_ratio
+        if (
+            depth_tolerance_m > 0.0
+            and status["depth_error_m"]
+            > active_depth_tolerance_m
+        ):
+            reasons.append(
+                "depth "
+                f"{status['depth_error_m']:.3f}m > "
+                f"{active_depth_tolerance_m:.3f}m "
+                f"({threshold_kind})"
+            )
+        if status["yaw_error_rad"] > active_yaw_tolerance_rad:
+            reasons.append(
+                "yaw "
+                f"{math.degrees(status['yaw_error_rad']):.2f}deg > "
+                f"{math.degrees(active_yaw_tolerance_rad):.2f}deg "
+                f"({threshold_kind})"
+            )
+        if reasons:
+            self._fixed_hook_line_interlock_active = True
+            self._fixed_hook_line_interlock_reason = "; ".join(reasons)
+            self.get_logger().warning(
+                "Fixed-hook line interlock froze new forward lead "
+                f"in {self.mission_state} at "
+                f"{self._fixed_hook_line_progress_m:.3f}m: "
+                f"{self._fixed_hook_line_interlock_reason}. NMPC is "
+                "holding the furthest measured line station/depth without "
+                "reversing, and correcting cross-track, depth, and yaw "
+                "before forward motion can resume.",
+                throttle_duration_sec=2.0,
+            )
+            return status
+
+        self._fixed_hook_line_interlock_active = False
+        self._fixed_hook_line_interlock_reason = ""
+        if was_interlocked:
+            self.get_logger().info(
+                "Fixed-hook line interlock cleared in "
+                f"{self.mission_state}; furthest measured progress "
+                f"{self._fixed_hook_line_progress_m:.3f}m, forward/back "
+                "reference resumed."
+            )
+        return status
+
+    def _fixed_hook_line_stage_reference(self, k, q_goal):
+        """Sample the measured-progress-governed Hook line horizon."""
+        line_start = np.asarray(self.traj_start_pos, dtype=float)
+        line_goal = np.asarray(self.traj_goal_pos, dtype=float)
+        line_delta = line_goal - line_start
+        line_length = float(np.linalg.norm(line_delta[0:2]))
+        base_progress_m = clamp(
+            float(getattr(self, "_fixed_hook_line_progress_m", 0.0)),
+            0.0,
+            line_length,
+        )
+        max_lead_m = float(
+            self.get_parameter(
+                "fixed_hook_line_max_reference_lead_m"
+            ).value
+        )
+        raw_progress_m = clamp(
+            float(getattr(
+                self,
+                "_fixed_hook_line_raw_progress_m",
+                0.0,
+            )),
+            0.0,
+            line_length,
+        )
+        # New forward advancement remains bounded by raw progress + max lead.
+        # After a backslide, however, the furthest measured station is also a
+        # reference floor. Holding an already traversed station can create a
+        # larger recovery error, but it can never command a return toward the
+        # phase start.
+        measured_reference_ceiling_m = min(
+            line_length,
+            raw_progress_m + max_lead_m,
+        )
+        reference_ceiling_m = max(
+            base_progress_m,
+            measured_reference_ceiling_m,
+        )
+        if bool(getattr(
+            self,
+            "_fixed_hook_line_interlock_active",
+            False,
+        )):
+            reference_progress_m = base_progress_m
+        else:
+            Ts = float(self.get_parameter("Ts").value)
+            speed_mps = max(self._phase_traj_speed(), 0.0)
+            stage_lead_m = min(
+                max(float(k), 0.0) * Ts * speed_mps,
+                max_lead_m,
+            )
+            reference_progress_m = min(
+                line_length,
+                base_progress_m + stage_lead_m,
+                reference_ceiling_m,
+            )
+
+        if line_length <= 1e-9:
+            alpha = 1.0
+            pref = line_goal.copy()
+        else:
+            alpha = reference_progress_m / line_length
+            pref = line_start + alpha * line_delta
+        pref[2] = line_start[2]
+        qref = quat_slerp_wxyz(
+            self.traj_start_q_wxyz,
+            q_goal,
+            alpha,
+        )
+        return pref, qref
+
+    def _fixed_hook_line_position_stage_reference(
+        self,
+        k,
+        q_goal,
+        *,
+        sample_time_sec=None,
+    ):
+        """Sample the monotonic time-parameterized horizontal Hook line."""
+        if sample_time_sec is None:
+            sample_time_sec = self._now_sec()
+        Ts = float(self.get_parameter("Ts").value)
+        t_stage_sec = max(
+            float(sample_time_sec) - self.traj_start_time_sec
+            + max(float(k), 0.0) * Ts,
+            0.0,
+        )
+        if self.traj_duration_sec <= 1e-9:
+            alpha = 1.0
+        else:
+            alpha = clamp(
+                t_stage_sec / self.traj_duration_sec,
+                0.0,
+                1.0,
+            )
+        pref = (
+            (1.0 - alpha) * np.asarray(self.traj_start_pos, dtype=float)
+            + alpha * np.asarray(self.traj_goal_pos, dtype=float)
+        )
+        # Both endpoints are validated level. Pinning depth makes the intent
+        # explicit and protects against numerical endpoint drift.
+        pref[2] = float(np.asarray(self.traj_start_pos, dtype=float)[2])
+        qref = quat_slerp_wxyz(
+            self.traj_start_q_wxyz,
+            q_goal,
+            alpha,
+        )
+        return pref, qref
+
+    def _set_path_trajectory(self, path_xy, goal_z, start_z=None):
+        if not path_xy:
+            raise ValueError("A* path trajectory requires at least one point")
 
         self._reset_position_integral()
 
         self.traj_start_time_sec = self._now_sec()
         self.traj_start_q_wxyz = np.asarray(self.q_wxyz, dtype=float).copy()
+        if (
+            getattr(
+                self,
+                "_dynamic_prehook_planner_enabled",
+                lambda: False,
+            )()
+            and getattr(self, "mission_state", "")
+            in ("PLAN_TO_PREHOOK", "TRACK_TO_PREHOOK")
+            and self._prehook_attitude_reference_mode()
+            == "capture_start_trim"
+            and getattr(self, "_prehook_trim_q_wxyz", None) is not None
+        ):
+            # Replanning must not recapture or rotate the attitude reference.
+            # Both ends of every pre-hook path retain the one mission-start
+            # trim. Compatibility recorded_hook mode keeps the original
+            # current-attitude-to-recorded-attitude interpolation.
+            self.traj_start_q_wxyz = self._prehook_reference_quaternion()
+        if start_z is None:
+            start_z = float(self.p_w[2])
+        start_z = float(start_z)
+        goal_z = float(goal_z)
+        if not math.isfinite(start_z) or not math.isfinite(goal_z):
+            raise ValueError("A* path endpoint depths must be finite")
 
-        self.path_points = [
-            np.array([float(x), float(y), float(goal_z)], dtype=float)
-            for x, y in path_xy
+        normalized_xy = [
+            (float(point[0]), float(point[1])) for point in path_xy
         ]
+        current_xy = (float(self.p_w[0]), float(self.p_w[1]))
+        if math.hypot(
+            normalized_xy[0][0] - current_xy[0],
+            normalized_xy[0][1] - current_xy[1],
+        ) > 1e-9:
+            normalized_xy.insert(0, current_xy)
+        else:
+            normalized_xy[0] = current_xy
+        if len(normalized_xy) == 1:
+            normalized_xy.append(normalized_xy[0])
+
+        planar_lengths = [
+            math.hypot(
+                normalized_xy[index + 1][0] - normalized_xy[index][0],
+                normalized_xy[index + 1][1] - normalized_xy[index][1],
+            )
+            for index in range(len(normalized_xy) - 1)
+        ]
+        planar_total = float(sum(planar_lengths))
+        self.path_points = []
+        planar_progress = 0.0
+        for index, (x, y) in enumerate(normalized_xy):
+            if index > 0:
+                planar_progress += planar_lengths[index - 1]
+            if planar_total > 1e-9:
+                z_alpha = planar_progress / planar_total
+            else:
+                z_alpha = index / max(1, len(normalized_xy) - 1)
+            z = (1.0 - z_alpha) * start_z + z_alpha * goal_z
+            self.path_points.append(
+                np.array([x, y, z], dtype=float)
+            )
+        self.path_points[0][2] = start_z
+        self.path_points[-1][2] = goal_z
         self.path_segment_lengths = []
         self.path_total_length = 0.0
         for i in range(len(self.path_points) - 1):
@@ -2061,8 +4088,22 @@ class MPCTrackTrajectoryAcados(Node):
         self.traj_goal_pos = self.path_points[-1].copy()
         speed = max(self._phase_traj_speed(), 1e-4)
         min_duration = max(float(self.get_parameter("min_traj_duration_s").value), float(self.get_parameter("Ts").value))
+        angular_duration = 0.0
+        angular_speed = float(
+            self.get_parameter("traj_angular_speed_rad_s").value
+        )
+        if not math.isfinite(angular_speed) or angular_speed < 0.0:
+            raise ValueError(
+                "traj_angular_speed_rad_s must be finite and >= 0"
+            )
+        if angular_speed > 0.0:
+            angular_duration = quat_angular_distance_wxyz(
+                self.traj_start_q_wxyz,
+                self._goal_quaternion(),
+            ) / angular_speed
         self.traj_duration_sec = max(
             self.path_total_length / speed,
+            angular_duration,
             min_duration,
         )
         self.traj_active = True
@@ -2090,6 +4131,16 @@ class MPCTrackTrajectoryAcados(Node):
     def _reset_trajectory_from_current_pose(self):
         goal_pos = self._goal_position()
 
+        if (
+            self._dynamic_prehook_planner_enabled()
+            and self.mission_state
+            in ("PLAN_TO_PREHOOK", "TRACK_TO_PREHOOK")
+        ):
+            self._plan_to_prehook_from_current(
+                reason="pre-hook trajectory reset"
+            )
+            return
+
         if self._planner_enabled_for_current_phase():
             try:
                 path_xy = self._build_astar_path_xy(self.p_w[0:2], goal_pos[0:2])
@@ -2102,10 +4153,347 @@ class MPCTrackTrajectoryAcados(Node):
 
         self._set_linear_trajectory(goal_pos)
 
+    def _prehook_alignment_status(self):
+        """Measure the independent pre-hook transition gates."""
+        position_tolerance_m = max(
+            float(self.get_parameter("goal_reached_tol_m").value),
+            1e-4,
+        )
+        position_error_m = float(
+            np.linalg.norm(self.p_w - self.traj_goal_pos)
+        )
+        depth_tolerance_m = max(
+            float(getattr(self, "fixed_hook_depth_tolerance_m", 0.0)),
+            0.0,
+        )
+        depth_error_m = abs(
+            float(self.p_w[2] - self.traj_goal_pos[2])
+        )
+        attitude_tolerance_rad = self._prehook_orientation_tolerance_rad()
+        goal_quaternion = np.asarray(
+            self._goal_quaternion(),
+            dtype=float,
+        )
+        attitude_error_rad = quat_angular_distance_wxyz(
+            self.q_wxyz,
+            goal_quaternion,
+        )
+        yaw_tolerance_rad = self._prehook_yaw_tolerance_rad()
+        current_yaw = quat_to_yaw_wxyz(self.q_wxyz)
+        goal_yaw = quat_to_yaw_wxyz(goal_quaternion)
+        yaw_error_rad = abs(wrap_pi(current_yaw - goal_yaw))
+        forward_axis_tolerance_rad = (
+            self._prehook_forward_axis_tolerance_rad()
+        )
+        forward_axis_error_rad = forward_axis_angular_distance_wxyz(
+            self.q_wxyz,
+            goal_quaternion,
+        )
+        position_ok = position_error_m <= position_tolerance_m
+        depth_ok = (
+            depth_tolerance_m <= 0.0
+            or depth_error_m <= depth_tolerance_m
+        )
+        orientation_ok = attitude_error_rad <= attitude_tolerance_rad
+        yaw_ok = yaw_error_rad <= yaw_tolerance_rad
+        forward_axis_ok = (
+            forward_axis_tolerance_rad <= 0.0
+            or forward_axis_error_rad <= forward_axis_tolerance_rad
+        )
+        attitude_ok = orientation_ok and forward_axis_ok and yaw_ok
+        return {
+            "position_error_m": position_error_m,
+            "position_tolerance_m": position_tolerance_m,
+            "position_ok": position_ok,
+            "depth_error_m": depth_error_m,
+            "depth_tolerance_m": depth_tolerance_m,
+            "depth_ok": depth_ok,
+            "attitude_error_rad": attitude_error_rad,
+            "attitude_tolerance_rad": attitude_tolerance_rad,
+            "orientation_ok": orientation_ok,
+            "yaw_error_rad": yaw_error_rad,
+            "yaw_tolerance_rad": yaw_tolerance_rad,
+            "yaw_ok": yaw_ok,
+            "forward_axis_error_rad": forward_axis_error_rad,
+            "forward_axis_tolerance_rad": forward_axis_tolerance_rad,
+            "forward_axis_ok": forward_axis_ok,
+            "attitude_ok": attitude_ok,
+            "translation_ready": position_ok and depth_ok,
+            "complete": position_ok and depth_ok and attitude_ok,
+            "reference_finished": self._position_integral_reference_finished(
+                self._now_sec()
+            ),
+            "goal_quaternion": goal_quaternion,
+        }
+
+    def _update_prehook_attitude_wait(
+        self,
+        status,
+        *,
+        now_monotonic=None,
+    ):
+        """Diagnose an attitude-only stall and apply an optional timeout."""
+        waiting_for_attitude = self._prehook_attitude_wait_active(status)
+        mandatory_context = getattr(
+            self,
+            "_prehook_replan_context",
+            None,
+        )
+        mandatory_plan_active = (
+            bool(
+                getattr(
+                    self,
+                    "_prehook_mandatory_replan_pending",
+                    False,
+                )
+            )
+            or (
+                mandatory_context is not None
+                and mandatory_context.get("request_level") == "mandatory"
+            )
+        )
+        timer_eligible = (
+            waiting_for_attitude
+            and status["reference_finished"]
+            and not bool(
+                getattr(self, "_prehook_planner_hold_active", False)
+            )
+            and not mandatory_plan_active
+        )
+        if not timer_eligible:
+            self._prehook_attitude_wait_since_monotonic = None
+            return False
+
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
+        if self._prehook_attitude_wait_since_monotonic is None:
+            self._prehook_attitude_wait_since_monotonic = now_monotonic
+        elapsed_s = max(
+            0.0,
+            float(now_monotonic)
+            - float(self._prehook_attitude_wait_since_monotonic),
+        )
+        timeout_s = float(
+            self.get_parameter(
+                "prehook_attitude_alignment_timeout_s"
+            ).value
+        )
+        timeout_enabled = timeout_s > 0.0
+        current_rpy = quat_to_rpy_wxyz(self.q_wxyz)
+        goal_rpy = quat_to_rpy_wxyz(status["goal_quaternion"])
+        rpy_error_deg = [
+            math.degrees(wrap_pi(current - goal))
+            for current, goal in zip(current_rpy, goal_rpy)
+        ]
+        wait_duration_text = (
+            f"{elapsed_s:.1f}/{timeout_s:.1f}s"
+            if timeout_enabled
+            else f"{elapsed_s:.1f}s (elapsed-time timeout disabled)"
+        )
+        forward_axis_tolerance_text = (
+            f"{math.degrees(status['forward_axis_tolerance_rad']):.2f}deg"
+            if status["forward_axis_tolerance_rad"] > 0.0
+            else "disabled"
+        )
+        self.get_logger().warning(
+            "Pre-hook transition blocked by attitude only: "
+            f"position={status['position_error_m']:.3f}m/"
+            f"{status['position_tolerance_m']:.3f}m, "
+            f"depth={status['depth_error_m']:.3f}m/"
+            f"{status['depth_tolerance_m']:.3f}m, "
+            f"attitude={math.degrees(status['attitude_error_rad']):.2f}deg/"
+            f"{math.degrees(status['attitude_tolerance_rad']):.2f}deg, "
+            "forward-axis="
+            f"{math.degrees(status['forward_axis_error_rad']):.2f}deg/"
+            f"{forward_axis_tolerance_text}, "
+            f"yaw={math.degrees(status['yaw_error_rad']):.2f}deg/"
+            f"{math.degrees(status['yaw_tolerance_rad']):.2f}deg, "
+            "RPY error="
+            f"[{rpy_error_deg[0]:.2f}, {rpy_error_deg[1]:.2f}, "
+            f"{rpy_error_deg[2]:.2f}]deg, "
+            f"current_q_wxyz={np.asarray(self.q_wxyz).tolist()}, "
+            f"goal_q_wxyz={status['goal_quaternion'].tolist()}, "
+            f"continuous={wait_duration_text}. "
+            "Optional A* improvement is suspended; path safety and "
+            "mandatory repair remain active.",
+            throttle_duration_sec=2.0,
+        )
+        if not timeout_enabled:
+            # The operator requested continuous NMPC alignment. Keep the
+            # Schmitt-trigger wait active indefinitely; normal mission,
+            # odometry, control-mode, command-freshness, bounds, and solver
+            # protections still fail closed elsewhere.
+            return False
+        if elapsed_s < timeout_s:
+            return False
+
+        self._retire_prehook_plan_request()
+        self._activate_prehook_planner_hold(
+            preserve_vertical_integral=True,
+        )
+        self._prehook_attitude_fault_latched = True
+        self.get_logger().error(
+            "Pre-hook attitude alignment timed out after "
+            f"{elapsed_s:.1f}s: translation is inside tolerance but "
+            f"attitude error remains "
+            f"{math.degrees(status['attitude_error_rad']):.2f}deg "
+            f"(limit {math.degrees(status['attitude_tolerance_rad']):.2f}deg). "
+            "A current-pose fault hold is latched and the controller "
+            "heartbeat remains active to avoid an automatic PX4 mode loss. "
+            "The old waypoint XY integral was cleared, while the bounded "
+            "world-Z support bias was preserved so positive buoyancy cannot "
+            "create a heave-command step at this transition. "
+            "DISARM first, then publish mission/offboard false. Inspect the "
+            "target and marker-to-body calibration, actuator allocation, "
+            "and external tether load before retrying."
+        )
+        return True
+
+    def _prehook_attitude_wait_active(self, status):
+        """Apply Schmitt-trigger translation gates to attitude waiting."""
+        timer_started = (
+            self._prehook_attitude_wait_since_monotonic is not None
+        )
+        hysteresis_ratio = float(
+            self.get_parameter(
+                "prehook_attitude_wait_exit_hysteresis_ratio"
+            ).value
+        )
+        position_inside_exit_gate = (
+            status["position_error_m"]
+            <= status["position_tolerance_m"] * hysteresis_ratio
+        )
+        depth_tolerance_m = status["depth_tolerance_m"]
+        depth_inside_exit_gate = (
+            depth_tolerance_m <= 0.0
+            or status["depth_error_m"]
+            <= depth_tolerance_m * hysteresis_ratio
+        )
+        if timer_started:
+            return (
+                position_inside_exit_gate
+                and depth_inside_exit_gate
+                and not status["attitude_ok"]
+            )
+        return (
+            status["translation_ready"] and not status["attitude_ok"]
+        )
+
+    def _update_dynamic_prehook_phase(self):
+        if not self._dynamic_prehook_planner_enabled():
+            return False
+        state = getattr(self, "mission_state", "")
+        if state == "PLAN_TO_PREHOOK":
+            self._poll_prehook_replan()
+            if (
+                self.mission_state == "PLAN_TO_PREHOOK"
+                and self._mission_allowed()
+                and self._prehook_replan_future is None
+            ):
+                self._plan_to_prehook_from_current(
+                    reason="PLAN_TO_PREHOOK recovery"
+                )
+            return True
+        if state == "TRACK_TO_PREHOOK":
+            if getattr(self, "_prehook_attitude_fault_latched", False):
+                # Keep solving the captured current-pose reference.  In
+                # particular, do not withdraw the controller heartbeat here:
+                # this vehicle has previously switched to Altitude and risen
+                # when PX4 lost Offboard.  The operator must DISARM before
+                # clearing the mission/offboard requests.
+                return True
+            preliminary_status = self._prehook_alignment_status()
+            suppress_optional_improvement = (
+                self._prehook_attitude_wait_active(preliminary_status)
+            )
+            self._poll_prehook_replan(
+                suppress_optional_improvement=(
+                    suppress_optional_improvement
+                )
+            )
+            if not self._mission_allowed():
+                return True
+            status = self._prehook_alignment_status()
+            suppress_optional_improvement = (
+                self._prehook_attitude_wait_active(status)
+            )
+            if self._trajectory_completion_reached():
+                self._retire_prehook_plan_request()
+                self._prehook_planner_hold_active = False
+                self._prehook_attitude_wait_since_monotonic = None
+                self.mission_state = "PREHOOK_REACHED"
+                self.state_enter_time_sec = self._now_sec()
+                self._prehook_reached_since_sec = self.state_enter_time_sec
+                self._enter_terminal_hold(self._goal_signature())
+                hold_s = float(
+                    self.get_parameter("prehook_reached_hold_s").value
+                )
+                self.get_logger().info(
+                    "Mission -> PREHOOK_REACHED: position, depth, and "
+                    "configured pre-hook attitude reference are inside "
+                    "tolerance; "
+                    f"requiring {hold_s:.2f}s continuous dwell."
+                )
+                return True
+            if self._update_prehook_attitude_wait(status):
+                return True
+            self._submit_prehook_replan_if_needed(
+                suppress_optional_improvement=(
+                    suppress_optional_improvement
+                )
+            )
+            return True
+        if state != "PREHOOK_REACHED":
+            return False
+
+        if not self._trajectory_completion_reached():
+            self._prehook_reached_since_sec = None
+            self.terminal_hold_goal_signature = None
+            self.last_goal_signature = None
+            self.get_logger().warning(
+                "PREHOOK_REACHED tolerance lost; dwell reset and mission "
+                "returns through PLAN_TO_PREHOOK."
+            )
+            self._plan_to_prehook_from_current(
+                reason="pre-hook dwell drift"
+            )
+            return True
+
+        if self._prehook_reached_since_sec is None:
+            self._prehook_reached_since_sec = self._now_sec()
+        hold_s = float(
+            self.get_parameter("prehook_reached_hold_s").value
+        )
+        if self._now_sec() - self._prehook_reached_since_sec < hold_s:
+            return True
+
+        self.mission_state = "GO_FORWARD"
+        self.state_enter_time_sec = self._now_sec()
+        self.active_goal_pos = self._goal_position_static()
+        self.active_goal_yaw = self._goal_yaw_static()
+        self.terminal_hold_goal_signature = None
+        self.last_goal_signature = None
+        self._prehook_planner_hold_active = False
+        self._reset_trajectory_from_current_pose()
+        self.get_logger().info(
+            "Pre-hook dwell complete; mission -> GO_FORWARD. A* is now "
+            "disabled for GO_FORWARD, WAIT_HOOK, and GO_BACK."
+        )
+        return True
+
     def _maybe_refresh_trajectory(self):
         self._update_mission()
 
         if not self.have_odom:
+            return
+
+        dynamic_prehook_update = getattr(
+            self, "_update_dynamic_prehook_phase", None
+        )
+        if (
+            dynamic_prehook_update is not None
+            and dynamic_prehook_update()
+        ):
             return
 
         if self._update_fixed_hook_hold_phase():
@@ -2156,7 +4544,7 @@ class MPCTrackTrajectoryAcados(Node):
     def _begin_fixed_hook_final_hold(self, goal_signature):
         if (
             bool(self.get_parameter("use_box_recovery_mission").value)
-            or self.mission_state != "FINAL_APPROACH"
+            or self.mission_state not in ("FINAL_APPROACH", "GO_FORWARD")
         ):
             return False
 
@@ -2171,24 +4559,71 @@ class MPCTrackTrajectoryAcados(Node):
         if hold_s <= 0.0 and not retreat_enabled:
             return False
 
-        self.mission_state = "FINAL_HOLD"
+        dynamic_names = self.mission_state == "GO_FORWARD"
+        self.mission_state = "WAIT_HOOK" if dynamic_names else "FINAL_HOLD"
         self.state_enter_time_sec = self._now_sec()
-        self._enter_terminal_hold(goal_signature)
-        self.get_logger().info(
-            "Recorded hook pose reached; mission -> FINAL_HOLD "
-            f"for {hold_s:.2f}s."
+        self._operator_hook_confirmation_pending = False
+        self._wait_hook_enter_monotonic = (
+            time.monotonic() if dynamic_names else None
         )
+        self._enter_terminal_hold(goal_signature)
+        if (
+            self.mission_state == "WAIT_HOOK"
+            and bool(
+                getattr(
+                    self,
+                    "require_operator_hook_confirmation",
+                    False,
+                )
+            )
+        ):
+            self.get_logger().info(
+                "Recorded hook pose reached; mission -> WAIT_HOOK. "
+                "Hook arrival is now latched: hold the recorded pose until "
+                "the operator visually confirms engagement and presses H. "
+                "Later pose drift will not cancel the H-to-GO_BACK request."
+            )
+        else:
+            self.get_logger().info(
+                "Recorded hook pose reached; mission -> "
+                f"{self.mission_state} "
+                f"for {hold_s:.2f}s."
+            )
         return True
 
     def _update_fixed_hook_hold_phase(self):
         if (
             bool(self.get_parameter("use_box_recovery_mission").value)
-            or self.mission_state != "FINAL_HOLD"
+            or self.mission_state not in ("FINAL_HOLD", "WAIT_HOOK")
         ):
             return False
 
-        if not self._trajectory_completion_reached():
-            self.mission_state = "FINAL_APPROACH"
+        operator_confirmation_required = (
+            self.mission_state == "WAIT_HOOK"
+            and bool(
+                getattr(
+                    self,
+                    "require_operator_hook_confirmation",
+                    False,
+                )
+            )
+        )
+
+        # WAIT_HOOK is an arrival latch, not a continuously re-evaluated pose
+        # gate.  Reaching the Hook tolerance once is enough to hand authority
+        # to the operator, who observes the physical hook rather than MoCap
+        # attitude noise.  Automatic/legacy holds retain their original drift
+        # restart behaviour.
+        if (
+            not operator_confirmation_required
+            and not self._trajectory_completion_reached()
+        ):
+            self._operator_hook_confirmation_pending = False
+            self._wait_hook_enter_monotonic = None
+            dynamic_names = self.mission_state == "WAIT_HOOK"
+            self.mission_state = (
+                "GO_FORWARD" if dynamic_names else "FINAL_APPROACH"
+            )
             self.state_enter_time_sec = self._now_sec()
             self.terminal_hold_goal_signature = None
             self.last_goal_signature = None
@@ -2196,14 +4631,30 @@ class MPCTrackTrajectoryAcados(Node):
             self._reset_trajectory_from_current_pose()
             self.get_logger().warning(
                 "Drifted outside the recorded hook-pose tolerance; "
-                "hold timer reset and mission -> FINAL_APPROACH."
+                "hold timer reset and mission -> "
+                f"{self.mission_state}."
             )
             return True
 
         hold_s = float(self.get_parameter("final_pose_hold_s").value)
         if not math.isfinite(hold_s) or hold_s < 0.0:
             raise ValueError("final_pose_hold_s must be finite and >= 0")
-        if self._now_sec() - self.state_enter_time_sec < hold_s:
+        if operator_confirmation_required:
+            if not bool(
+                getattr(
+                    self,
+                    "_operator_hook_confirmation_pending",
+                    False,
+                )
+            ):
+                return True
+            # The service callback already checked mission/control/odometry/
+            # solver/command liveness.  Consume the operator's one-shot
+            # without rechecking Hook pose: WAIT_HOOK itself proves that the
+            # arrival tolerance was satisfied at least once.
+            self._operator_hook_confirmation_pending = False
+            self._wait_hook_enter_monotonic = None
+        elif self._now_sec() - self.state_enter_time_sec < hold_s:
             return True
 
         retreat_enabled = bool(
@@ -2217,16 +4668,25 @@ class MPCTrackTrajectoryAcados(Node):
                     "return_to_pre_approach_after_hold requires "
                     "use_pre_approach_waypoint=true"
                 )
-            self.mission_state = "RETREAT"
+            dynamic_names = self.mission_state == "WAIT_HOOK"
+            self.mission_state = "GO_BACK" if dynamic_names else "RETREAT"
             self.state_enter_time_sec = self._now_sec()
             self.terminal_hold_goal_signature = None
             self.last_goal_signature = None
             self._update_mission()
             self._reset_trajectory_from_current_pose()
-            self.get_logger().info(
-                "Final-pose hold complete; mission -> RETREAT along the "
-                "straight line to the pre-approach pose."
-            )
+            if operator_confirmation_required:
+                self.get_logger().info(
+                    "Operator Hook confirmation consumed; mission -> "
+                    f"{self.mission_state} along the straight line to the "
+                    "pre-approach pose."
+                )
+            else:
+                self.get_logger().info(
+                    "Final-pose hold complete; mission -> "
+                    f"{self.mission_state} along the "
+                    "straight line to the pre-approach pose."
+                )
         else:
             self.mission_state = "FINAL_COMPLETE"
             self.state_enter_time_sec = self._now_sec()
@@ -2238,7 +4698,7 @@ class MPCTrackTrajectoryAcados(Node):
     def _complete_fixed_hook_retreat(self, goal_signature):
         if (
             bool(self.get_parameter("use_box_recovery_mission").value)
-            or self.mission_state != "RETREAT"
+            or self.mission_state not in ("RETREAT", "GO_BACK")
         ):
             return False
         self.mission_state = "COMPLETE"
@@ -2274,10 +4734,81 @@ class MPCTrackTrajectoryAcados(Node):
         if np.linalg.norm(self.p_w - self.traj_goal_pos) > goal_tol:
             return False
 
+        fixed_hook_governor_active = getattr(
+            self,
+            "_fixed_hook_line_governor_active",
+            lambda: False,
+        )()
+        if fixed_hook_governor_active:
+            if bool(getattr(
+                self,
+                "_fixed_hook_line_interlock_active",
+                False,
+            )):
+                return False
+            # _maybe_refresh_trajectory checks completion before the regular
+            # per-solve governor update. Recompute the corridor from the
+            # latest odometry here so a same-tick corridor excursion cannot
+            # bypass the profile's stricter line interlock via the broader
+            # Hook-pose gate.
+            governor_status = self._fixed_hook_line_governor_status()
+            cross_track_tolerance_m = float(
+                self.get_parameter(
+                    "fixed_hook_line_cross_track_tol_m"
+                ).value
+            )
+            yaw_tolerance_rad = float(
+                self.get_parameter("fixed_hook_line_yaw_tol_rad").value
+            )
+            depth_tolerance_m = max(
+                float(getattr(
+                    self,
+                    "fixed_hook_depth_tolerance_m",
+                    0.0,
+                )),
+                0.0,
+            )
+            if (
+                governor_status["cross_track_m"]
+                > cross_track_tolerance_m
+                or governor_status["yaw_error_rad"] > yaw_tolerance_rad
+                or (
+                    depth_tolerance_m > 0.0
+                    and governor_status["depth_error_m"]
+                    > depth_tolerance_m
+                )
+            ):
+                return False
+            line_length_m = governor_status["line_length_m"]
+            max_reference_lead_m = float(
+                self.get_parameter(
+                    "fixed_hook_line_max_reference_lead_m"
+                ).value
+            )
+            reference_front_m = min(
+                line_length_m,
+                float(getattr(
+                    self,
+                    "_fixed_hook_line_progress_m",
+                    0.0,
+                ))
+                + max_reference_lead_m,
+                governor_status["raw_progress_m"]
+                + max_reference_lead_m,
+            )
+            if reference_front_m < line_length_m - 1e-6:
+                return False
+
         fixed_hook_depth_states = (
+            "PLAN_TO_PREHOOK",
+            "TRACK_TO_PREHOOK",
+            "PREHOOK_REACHED",
             "PRE_APPROACH",
+            "GO_FORWARD",
             "FINAL_APPROACH",
+            "WAIT_HOOK",
             "FINAL_HOLD",
+            "GO_BACK",
             "RETREAT",
             "COMPLETE",
         )
@@ -2294,7 +4825,13 @@ class MPCTrackTrajectoryAcados(Node):
             return False
 
         pre_approach_requires_attitude = (
-            getattr(self, "mission_state", "") == "PRE_APPROACH"
+            getattr(self, "mission_state", "")
+            in (
+                "PLAN_TO_PREHOOK",
+                "TRACK_TO_PREHOOK",
+                "PREHOOK_REACHED",
+                "PRE_APPROACH",
+            )
             and not bool(
                 self.get_parameter("use_box_recovery_mission").value
             )
@@ -2304,20 +4841,67 @@ class MPCTrackTrajectoryAcados(Node):
             bool(self.get_parameter("hold_attitude").value)
             or pre_approach_requires_attitude
         ):
-            orientation_tol = max(
-                float(
-                    self.get_parameter(
-                        "goal_reached_orientation_tol_rad"
-                    ).value
-                ),
-                1e-4,
-            )
+            if (
+                getattr(
+                    self,
+                    "_dynamic_prehook_planner_enabled",
+                    lambda: False,
+                )()
+                and getattr(self, "mission_state", "")
+                in (
+                    "PLAN_TO_PREHOOK",
+                    "TRACK_TO_PREHOOK",
+                    "PREHOOK_REACHED",
+                )
+            ):
+                orientation_tol = (
+                    self._prehook_orientation_tolerance_rad()
+                )
+            else:
+                orientation_tol = max(
+                    float(
+                        self.get_parameter(
+                            "goal_reached_orientation_tol_rad"
+                        ).value
+                    ),
+                    1e-4,
+                )
             orientation_error = quat_angular_distance_wxyz(
                 self.q_wxyz,
                 self._goal_quaternion(),
             )
             if orientation_error > orientation_tol:
                 return False
+            if (
+                getattr(
+                    self,
+                    "_dynamic_prehook_planner_enabled",
+                    lambda: False,
+                )()
+                and getattr(self, "mission_state", "")
+                in (
+                    "PLAN_TO_PREHOOK",
+                    "TRACK_TO_PREHOOK",
+                    "PREHOOK_REACHED",
+                )
+            ):
+                yaw_error = abs(wrap_pi(
+                    quat_to_yaw_wxyz(self.q_wxyz)
+                    - quat_to_yaw_wxyz(self._goal_quaternion())
+                ))
+                if yaw_error > self._prehook_yaw_tolerance_rad():
+                    return False
+                forward_axis_tolerance = (
+                    self._prehook_forward_axis_tolerance_rad()
+                )
+                if (
+                    forward_axis_tolerance > 0.0
+                    and forward_axis_angular_distance_wxyz(
+                        self.q_wxyz,
+                        self._goal_quaternion(),
+                    ) > forward_axis_tolerance
+                ):
+                    return False
 
         if bool(self.get_parameter("use_box_recovery_mission").value):
             return self._at_active_goal()
@@ -2334,10 +4918,123 @@ class MPCTrackTrajectoryAcados(Node):
     def _trajectory_stage_param(self, k: int):
         q_goal = self._goal_quaternion()
         hold_att_flag = 1.0 if bool(self.get_parameter("hold_attitude").value) else 0.0
+        zero_velocity_reference = np.zeros(3, dtype=float)
+        default_velocity_cost_scale = np.array([1.0], dtype=float)
+
+        if (
+            getattr(self, "_prehook_planner_hold_active", False)
+            and getattr(self, "mission_state", "")
+            in ("PLAN_TO_PREHOOK", "TRACK_TO_PREHOOK")
+        ):
+            return np.concatenate([
+                np.asarray(self._prehook_planner_hold_pos, dtype=float),
+                np.asarray(
+                    self._prehook_planner_hold_q_wxyz, dtype=float
+                ),
+                np.array([hold_att_flag], dtype=float),
+                zero_velocity_reference,
+                default_velocity_cost_scale,
+            ])
 
         if not self.traj_active:
             pref = self._goal_position()
-            return np.concatenate([pref, q_goal, np.array([hold_att_flag], dtype=float)])
+            return np.concatenate([
+                pref,
+                q_goal,
+                np.array([hold_att_flag], dtype=float),
+                zero_velocity_reference,
+                default_velocity_cost_scale,
+            ])
+
+        if getattr(
+            self,
+            "_fixed_hook_line_position_mode_active",
+            lambda: False,
+        )():
+            # This is the real-robot straight-line mode. The reference moves
+            # from the configured phase start to its endpoint at the requested
+            # speed regardless of ordinary cross-track/depth/yaw error. It can
+            # therefore neither freeze and brake halfway nor rewind toward
+            # pre-hook. NMPC corrects all other axes concurrently.
+            sample_time_sec = self._now_sec()
+            pref, qref = self._fixed_hook_line_position_stage_reference(
+                k,
+                q_goal,
+                sample_time_sec=sample_time_sec,
+            )
+            next_pref, _next_qref = (
+                self._fixed_hook_line_position_stage_reference(
+                    k + 1,
+                    q_goal,
+                    sample_time_sec=sample_time_sec,
+                )
+            )
+            Ts = float(self.get_parameter("Ts").value)
+            velocity_reference_world = (next_pref - pref) / Ts
+            # The straight Hook line is horizontal by construction. Do not
+            # permit numerical SLERP/timing details to create a heave
+            # reference: Position-like translation always asks for zero NED
+            # depth velocity. Sampling k+1 even for the terminal stage also
+            # avoids commanding an artificial stop one horizon ahead while
+            # the line reference is still moving.
+            velocity_reference_world[2] = 0.0
+            velocity_cost_scale = math.sqrt(float(
+                self.get_parameter(
+                    "fixed_hook_line_velocity_weight_multiplier"
+                ).value
+            ))
+            return np.concatenate([
+                pref,
+                qref,
+                np.array([hold_att_flag], dtype=float),
+                velocity_reference_world,
+                np.array([velocity_cost_scale], dtype=float),
+            ])
+
+        if getattr(
+            self,
+            "_fixed_hook_line_governor_active",
+            lambda: False,
+        )():
+            pref, qref = self._fixed_hook_line_stage_reference(k, q_goal)
+            velocity_reference_world = zero_velocity_reference
+            # The transit multiplier is meant to make the commanded along-line
+            # speed authoritative while the corridor is safe.  During an
+            # interlock every stage is intentionally frozen, so its velocity
+            # reference is zero.  Keeping the multiplier in that state would
+            # heavily penalize the lateral/depth motion needed to realign (and
+            # the motion needed to return to the last accepted line point).
+            # Restore the ordinary velocity cost while preserving the frozen
+            # position horizon and zero feed-forward.
+            if bool(getattr(
+                self,
+                "_fixed_hook_line_interlock_active",
+                False,
+            )):
+                velocity_cost_scale = 1.0
+            else:
+                velocity_cost_scale = math.sqrt(float(
+                    self.get_parameter(
+                        "fixed_hook_line_velocity_weight_multiplier"
+                    ).value
+                ))
+            if k < self.N_horizon:
+                next_pref, _next_qref = (
+                    self._fixed_hook_line_stage_reference(
+                        k + 1,
+                        q_goal,
+                    )
+                )
+                Ts = float(self.get_parameter("Ts").value)
+                velocity_reference_world = (next_pref - pref) / Ts
+                velocity_reference_world[2] = 0.0
+            return np.concatenate([
+                pref,
+                qref,
+                np.array([hold_att_flag], dtype=float),
+                velocity_reference_world,
+                np.array([velocity_cost_scale], dtype=float),
+            ])
 
         t_now = self._now_sec()
         Ts = float(self.get_parameter("Ts").value)
@@ -2358,7 +5055,13 @@ class MPCTrackTrajectoryAcados(Node):
             q_goal,
             alpha,
         )
-        return np.concatenate([pref, qref, np.array([hold_att_flag], dtype=float)])
+        return np.concatenate([
+            pref,
+            qref,
+            np.array([hold_att_flag], dtype=float),
+            zero_velocity_reference,
+            default_velocity_cost_scale,
+        ])
 
     def _forceN_to_thrust_norm(self, F_N):
         return np.asarray(F_N, dtype=float) / self.force_axis_max_N
@@ -2421,6 +5124,13 @@ class MPCTrackTrajectoryAcados(Node):
                 )
             else:
                 self._maybe_refresh_trajectory()
+                if not self._mission_allowed():
+                    return
+
+            # This is the only per-solve mutation of the final Hook line
+            # progress. Horizon-stage sampling below is pure, so N+1 calls
+            # cannot accidentally advance a wall-clock-like governor.
+            self._update_fixed_hook_line_governor()
 
             for k in range(self.N_horizon):
                 p_k = self._trajectory_stage_param(k)
@@ -2593,6 +5303,13 @@ class MPCTrackTrajectoryAcados(Node):
                 throttle_duration_sec=1.0,
             )
             self._invalidate_command(reset_trajectory=True, publish_zero=True)
+
+    def destroy_node(self):
+        executor = getattr(self, "_prehook_replan_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._prehook_replan_executor = None
+        return super().destroy_node()
 
 
 def main():

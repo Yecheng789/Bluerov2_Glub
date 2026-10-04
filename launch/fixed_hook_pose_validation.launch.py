@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the guarded real-pool fixed-hook target-pose validation."""
 
+import hashlib
 import json
 import math
 import os
@@ -13,6 +14,10 @@ from bluerov2_control.nav_odom_to_vehicle_odometry import (
     _quat_xyzw_to_matrix,
 )
 from bluerov2_control.offboard_enable import versioned_px4_topic
+from bluerov2_control.planner_astar import (
+    OccupancyGrid2D as PlannerOccupancyGrid2D,
+    line_segment_is_free as planner_line_segment_is_free,
+)
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -33,6 +38,7 @@ from px4_msgs.msg import VehicleCommandAck, VehicleStatus
 MISSION_ENABLE_TOPIC = '/bluerov2/fixed_hook/mission_enable'
 OFFBOARD_REQUEST_TOPIC = '/bluerov2/fixed_hook/offboard_request_enable'
 CONTROLLER_HEARTBEAT_TOPIC = '/bluerov2/fixed_hook/controller_heartbeat'
+HOOK_CONFIRMATION_SERVICE = '/bluerov2/fixed_hook/confirm_hook'
 TRIAL_EVENT_TOPIC = '/bluerov2/trial_event'
 EXPECTED_ACK_MESSAGE_VERSION = 0
 EXPECTED_STATUS_MESSAGE_VERSION = 1
@@ -66,6 +72,16 @@ def _parse_float(context, name, minimum=None, maximum=None):
     return value
 
 
+def _parse_optional_timeout(context, name):
+    """Parse zero=disabled or a guarded timeout of at least five seconds."""
+    value = _parse_float(context, name, minimum=0.0, maximum=120.0)
+    if 0.0 < value < 5.0:
+        raise RuntimeError(
+            f'{name} must be 0 (disabled) or >= 5.0'
+        )
+    return value
+
+
 def _parse_int(context, name, minimum, maximum):
     text = _argument(context, name)
     if text.lower() == 'unconfigured':
@@ -92,6 +108,43 @@ def _parse_choice(context, name, choices):
             f'{name}={value!r} is not configured; choose one of: {expected}'
         )
     return value
+
+
+def _parse_static_obstacle_rectangles(context):
+    """Parse optional real-NED AABBs as xmin xmax ymin ymax groups."""
+    text = _argument(context, 'prehook_static_obstacles_ned_xyxy')
+    if not text:
+        return [], ''
+    rectangles = []
+    for index, group in enumerate(text.split(';'), start=1):
+        words = group.replace(',', ' ').split()
+        if len(words) != 4:
+            raise RuntimeError(
+                'prehook_static_obstacles_ned_xyxy rectangle '
+                f'{index} must contain xmin xmax ymin ymax'
+            )
+        try:
+            rectangle = tuple(float(word) for word in words)
+        except ValueError as exc:
+            raise RuntimeError(
+                'prehook_static_obstacles_ned_xyxy must contain numbers'
+            ) from exc
+        if not all(math.isfinite(value) for value in rectangle):
+            raise RuntimeError(
+                'prehook_static_obstacles_ned_xyxy must contain finite values'
+            )
+        xmin, xmax, ymin, ymax = rectangle
+        if xmin >= xmax or ymin >= ymax:
+            raise RuntimeError(
+                'prehook_static_obstacles_ned_xyxy requires xmin < xmax '
+                'and ymin < ymax for every rectangle'
+            )
+        rectangles.append(rectangle)
+    normalized = ';'.join(
+        ' '.join(f'{value:.9g}' for value in rectangle)
+        for rectangle in rectangles
+    )
+    return rectangles, normalized
 
 
 def _validate_firmware_matched_px4_msgs():
@@ -271,6 +324,178 @@ def _load_target_payload(path):
     if not isinstance(payload, dict):
         raise RuntimeError('target_config must contain a JSON object')
     return payload
+
+
+def _sha256_file(path):
+    """Return the SHA-256 digest of a target provenance file."""
+    digest = hashlib.sha256()
+    try:
+        with path.open('rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(block)
+    except OSError as exc:
+        raise RuntimeError(f'cannot hash source target config={path}: {exc}') \
+            from exc
+    return digest.hexdigest()
+
+
+def _strict_identity_transfer(values, expected, field_name):
+    """Validate an explicitly declared identity pose-transfer component."""
+    if not isinstance(values, list) or len(values) != len(expected):
+        raise RuntimeError(
+            f'derived target {field_name} must contain {len(expected)} values'
+        )
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in values
+    ):
+        raise RuntimeError(
+            f'derived target {field_name} must contain JSON numbers'
+        )
+    array = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(array)) or not np.array_equal(
+        array, np.asarray(expected, dtype=float)
+    ):
+        raise RuntimeError(
+            f'derived target {field_name} must be the exact identity value '
+            f'{list(expected)}'
+        )
+
+
+def _resolve_target_payload(target_path, expected_pose_topic, allow_derived):
+    """Resolve a direct recording or a hash-locked identity derivation."""
+    manifest = _load_target_payload(target_path)
+    if manifest.get('status') == 'invalidated_for_control':
+        raise RuntimeError(
+            'target_config is explicitly marked invalidated_for_control; '
+            'record a new target from the active robot MoCap rigid body'
+        )
+    derivation = manifest.get('derived_target')
+    if derivation is None:
+        source_topic = str(manifest.get('source_topic', '')).strip()
+        if source_topic != expected_pose_topic:
+            raise RuntimeError(
+                f'target source_topic must be {expected_pose_topic}; record '
+                'a new raw MoCap target for this rigid body'
+            )
+        return manifest, {
+            'kind': 'direct_mocap_recording',
+            'source_config': str(target_path),
+            'source_pose_topic': source_topic,
+            'destination_pose_topic': expected_pose_topic,
+        }
+
+    if not allow_derived:
+        raise RuntimeError(
+            'target_config is an identity-derived target, but this launch '
+            'profile does not explicitly allow derived targets'
+        )
+    if not isinstance(derivation, dict):
+        raise RuntimeError('derived_target must contain a JSON object')
+    if derivation.get('schema_version') != 1:
+        raise RuntimeError('derived target schema_version must be 1')
+    if derivation.get('type') != 'identity_pose_transfer':
+        raise RuntimeError(
+            'derived target type must be identity_pose_transfer'
+        )
+    if derivation.get('operator_confirmed_equivalent_geometry') is not True:
+        raise RuntimeError(
+            'derived target requires explicit operator confirmation of '
+            'equivalent robot and rigid-body geometry'
+        )
+    if derivation.get('operator_confirmed_same_target_pose') is not True:
+        raise RuntimeError(
+            'derived target requires explicit operator confirmation that '
+            'the fixed Hook target pose is unchanged'
+        )
+
+    destination_topic = str(
+        derivation.get('destination_pose_topic', '')
+    ).strip()
+    if destination_topic != expected_pose_topic:
+        raise RuntimeError(
+            'derived target destination_pose_topic must be '
+            f'{expected_pose_topic}'
+        )
+    source_topic = str(derivation.get('source_pose_topic', '')).strip()
+    if not source_topic or source_topic == destination_topic:
+        raise RuntimeError(
+            'derived target source_pose_topic must identify the distinct '
+            'original recording topic'
+        )
+
+    _strict_identity_transfer(
+        derivation.get('position_offset_m'),
+        [0.0, 0.0, 0.0],
+        'position_offset_m',
+    )
+    _strict_identity_transfer(
+        derivation.get('orientation_offset_xyzw'),
+        [0.0, 0.0, 0.0, 1.0],
+        'orientation_offset_xyzw',
+    )
+
+    source_name = str(derivation.get('source_config', '')).strip()
+    if not source_name or Path(source_name).name != source_name:
+        raise RuntimeError(
+            'derived target source_config must be a filename in the same '
+            'directory as target_config'
+        )
+    source_path = (target_path.parent / source_name).resolve()
+    if source_path.parent != target_path.parent or source_path == target_path:
+        raise RuntimeError('derived target source_config path is invalid')
+
+    expected_sha256 = str(
+        derivation.get('source_config_sha256', '')
+    ).strip().lower()
+    if (
+        len(expected_sha256) != 64
+        or any(character not in '0123456789abcdef'
+               for character in expected_sha256)
+    ):
+        raise RuntimeError(
+            'derived target source_config_sha256 must be 64 hexadecimal '
+            'characters'
+        )
+    actual_sha256 = _sha256_file(source_path)
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            'derived target source_config SHA-256 mismatch; do not use a '
+            'modified or substituted source recording'
+        )
+
+    source_payload = _load_target_payload(source_path)
+    if source_payload.get('derived_target') is not None:
+        raise RuntimeError('derived target chains are not allowed')
+    if str(source_payload.get('source_topic', '')).strip() != source_topic:
+        raise RuntimeError(
+            'derived target source_pose_topic does not match the source '
+            'recording provenance'
+        )
+    for field_name in (
+        'frame_id',
+        'message_type',
+        'source_topic',
+        'target_pose',
+    ):
+        if manifest.get(field_name) != source_payload.get(field_name):
+            raise RuntimeError(
+                f'derived target {field_name} snapshot does not exactly '
+                'match the hash-locked source recording'
+            )
+
+    return source_payload, {
+        'kind': 'identity_pose_transfer',
+        'manifest_config': str(target_path),
+        'source_config': str(source_path),
+        'source_config_sha256': actual_sha256,
+        'source_pose_topic': source_topic,
+        'destination_pose_topic': destination_topic,
+        'position_offset_m': [0.0, 0.0, 0.0],
+        'orientation_offset_xyzw': [0.0, 0.0, 0.0, 1.0],
+        'operator_confirmed_equivalent_geometry': True,
+        'operator_confirmed_same_target_pose': True,
+    }
 
 
 def _validate_recording(payload, context):
@@ -571,23 +796,22 @@ def _launch_setup(context, *args, **kwargs):
         )
 
     target_text = _argument(context, 'target_config')
-    if not target_text:
+    if not target_text or target_text.lower() == 'unconfigured':
         raise RuntimeError(
             'target_config is required; manually hook the target and record a '
             'new validated MoCap pose before launching this experiment'
         )
     target_path = Path(target_text).expanduser().resolve()
-    payload = _load_target_payload(target_path)
     raw_pose_topic = f'/mocap/{rigid_body_name}/pose'
+    payload, target_provenance = _resolve_target_payload(
+        target_path,
+        raw_pose_topic,
+        _parse_bool(context, 'allow_identity_derived_target'),
+    )
     if payload.get('message_type') != 'geometry_msgs/PoseStamped':
         raise RuntimeError(
             'fixed-hook reality validation requires a target recorded '
             'directly from geometry_msgs/PoseStamped, not filtered odometry'
-        )
-    if str(payload.get('source_topic', '')).strip() != raw_pose_topic:
-        raise RuntimeError(
-            f'target source_topic must be {raw_pose_topic}; record a new raw '
-            'MoCap target for this rigid body'
         )
     target_frame_id = str(payload.get('frame_id', '')).strip()
     if not target_frame_id:
@@ -686,6 +910,189 @@ def _launch_setup(context, *args, **kwargs):
         pool_bounds['operating_max_ned'],
         'converted pre-approach position',
     )
+    planner_check_rate_hz = _parse_float(
+        context,
+        'prehook_planner_check_rate_hz',
+        minimum=2.0,
+        maximum=5.0,
+    )
+    replan_deviation_m = _parse_float(
+        context, 'prehook_replan_deviation_m', minimum=0.05, maximum=1.0
+    )
+    replan_deviation_hold_s = _parse_float(
+        context,
+        'prehook_replan_deviation_hold_s',
+        minimum=0.0,
+        maximum=5.0,
+    )
+    replan_min_switch_interval_s = _parse_float(
+        context,
+        'prehook_replan_min_switch_interval_s',
+        minimum=0.0,
+        maximum=10.0,
+    )
+    replan_min_improvement_m = _parse_float(
+        context,
+        'prehook_replan_min_improvement_m',
+        minimum=0.0,
+        maximum=1.0,
+    )
+    replan_min_improvement_ratio = _parse_float(
+        context,
+        'prehook_replan_min_improvement_ratio',
+        minimum=0.0,
+        maximum=1.0,
+    )
+    replan_optimization_period_s = _parse_float(
+        context,
+        'prehook_replan_optimization_period_s',
+        minimum=0.0,
+        maximum=30.0,
+    )
+    prehook_reached_hold_s = _parse_float(
+        context, 'prehook_reached_hold_s', minimum=0.0, maximum=10.0
+    )
+    prehook_attitude_reference_mode = _parse_choice(
+        context,
+        'prehook_attitude_reference_mode',
+        {'recorded_hook', 'capture_start_trim'},
+    )
+    prehook_reached_orientation_tol_deg = _parse_float(
+        context,
+        'prehook_reached_orientation_tol_deg',
+        minimum=1.0,
+        maximum=20.0,
+    )
+    prehook_reached_forward_axis_tol_deg = _parse_float(
+        context,
+        'prehook_reached_forward_axis_tol_deg',
+        minimum=0.5,
+        maximum=20.0,
+    )
+    prehook_reached_yaw_tol_deg = _parse_float(
+        context,
+        'prehook_reached_yaw_tol_deg',
+        minimum=0.5,
+        maximum=20.0,
+    )
+    fixed_hook_line_position_mode = _parse_bool(
+        context,
+        'fixed_hook_line_position_mode',
+    )
+    fixed_hook_line_yaw_tol_deg = _parse_float(
+        context,
+        'fixed_hook_line_yaw_tol_deg',
+        minimum=0.5,
+        maximum=20.0,
+    )
+    fixed_hook_line_cross_track_tol_m = _parse_float(
+        context,
+        'fixed_hook_line_cross_track_tol_m',
+        minimum=0.005,
+        maximum=0.20,
+    )
+    fixed_hook_line_interlock_release_ratio = _parse_float(
+        context,
+        'fixed_hook_line_interlock_release_ratio',
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if fixed_hook_line_interlock_release_ratio <= 0.0:
+        raise RuntimeError(
+            'fixed_hook_line_interlock_release_ratio must be > 0'
+        )
+    fixed_hook_line_max_reference_lead_m = _parse_float(
+        context,
+        'fixed_hook_line_max_reference_lead_m',
+        minimum=0.005,
+        maximum=0.20,
+    )
+    fixed_hook_line_velocity_weight_multiplier = _parse_float(
+        context,
+        'fixed_hook_line_velocity_weight_multiplier',
+        minimum=1.0,
+        maximum=50.0,
+    )
+    prehook_attitude_wait_exit_hysteresis_ratio = _parse_float(
+        context,
+        'prehook_attitude_wait_exit_hysteresis_ratio',
+        minimum=1.0,
+        maximum=3.0,
+    )
+    prehook_attitude_alignment_timeout_s = _parse_optional_timeout(
+        context,
+        'prehook_attitude_alignment_timeout_s',
+    )
+    astar_resolution = _parse_float(
+        context, 'prehook_astar_resolution_m', minimum=0.03, maximum=0.25
+    )
+    astar_robot_radius = _parse_float(
+        context, 'prehook_robot_radius_m', minimum=0.05, maximum=0.60
+    )
+    astar_obstacle_margin = _parse_float(
+        context, 'prehook_obstacle_margin_m', minimum=0.0, maximum=0.50
+    )
+    smoothing_iterations = _parse_int(
+        context, 'prehook_path_smoothing_iterations', 0, 4
+    )
+    smoothing_corner_fraction = _parse_float(
+        context,
+        'prehook_path_smoothing_corner_fraction',
+        minimum=0.01,
+        maximum=0.49,
+    )
+    smoothing_samples = _parse_int(
+        context, 'prehook_path_smoothing_samples_per_corner', 2, 12
+    )
+    static_obstacles, static_obstacles_text = (
+        _parse_static_obstacle_rectangles(context)
+    )
+    obstacle_inflation = astar_robot_radius + astar_obstacle_margin
+    if pool_safety_margin + 1e-9 < obstacle_inflation:
+        raise RuntimeError(
+            'pool_safety_margin_m must be at least '
+            'prehook_robot_radius_m + prehook_obstacle_margin_m so the '
+            'real-NED A* pool-wall clearance covers the configured robot '
+            'collision envelope'
+        )
+    inflated_obstacles = []
+    for index, rectangle in enumerate(static_obstacles, start=1):
+        xmin, xmax, ymin, ymax = rectangle
+        inflated = (
+            xmin - obstacle_inflation,
+            xmax + obstacle_inflation,
+            ymin - obstacle_inflation,
+            ymax + obstacle_inflation,
+        )
+        inflated_obstacles.append(inflated)
+        if (
+            inflated[0] <= pre_approach_position[0] <= inflated[1]
+            and inflated[2] <= pre_approach_position[1] <= inflated[3]
+        ):
+            raise RuntimeError(
+                f'pre-hook waypoint lies inside inflated static obstacle '
+                f'{index}; correct the measured real-NED obstacle geometry'
+            )
+    final_corridor_grid = PlannerOccupancyGrid2D(
+        bounds=(
+            float(pool_bounds['operating_min_ned'][0]),
+            float(pool_bounds['operating_max_ned'][0]),
+            float(pool_bounds['operating_min_ned'][1]),
+            float(pool_bounds['operating_max_ned'][1]),
+        ),
+        resolution=astar_resolution,
+        obstacles=inflated_obstacles,
+    )
+    if not planner_line_segment_is_free(
+        final_corridor_grid,
+        tuple(float(value) for value in pre_approach_position[0:2]),
+        tuple(float(value) for value in target_position[0:2]),
+    ):
+        raise RuntimeError(
+            'the fixed pre-hook-to-hook GO_FORWARD/GO_BACK corridor '
+            'intersects an inflated no-contact static obstacle; correct the '
+            'real-NED obstacle geometry or move the fixed hook corridor'
+        )
     thrust_sat = _parse_float(
         context, 'thrust_sat', minimum=0.0, maximum=0.20
     )
@@ -840,8 +1247,10 @@ def _launch_setup(context, *args, **kwargs):
             'reject_unexpected_pose_frame': True,
             'max_position_innovation_m': 0.20,
             'max_orientation_innovation_rad': 0.55,
-            # Tilt is checked after the explicit NED/FRD conversion in MPC.
-            'max_base_link_z_axis_angle_rad': 0.0,
+            # Reject a physically implausible MoCap attitude before its
+            # prediction can reach MPC; keep automatic EKF reinitialization
+            # disabled so a repeated bad pose cannot become the new state.
+            'max_base_link_z_axis_angle_rad': 0.55,
         }],
     )
 
@@ -912,11 +1321,81 @@ def _launch_setup(context, *args, **kwargs):
             ),
             'final_pose_hold_s': final_pose_hold_s,
             'return_to_pre_approach_after_hold': True,
+            'require_operator_hook_confirmation': True,
+            'hook_confirmation_service': HOOK_CONFIRMATION_SERVICE,
+            'hook_confirmation_min_wait_s': 0.25,
             'backward_pass_speed_mps': retreat_speed_mps,
             'goal_reached_tol_m': 0.05,
             'goal_reached_orientation_tol_rad': math.radians(5.0),
             'regenerate_on_goal_change': False,
-            'planner_mode': 'none',
+            'planner_mode': 'astar',
+            'use_dynamic_prehook_planner': True,
+            'prehook_planner_check_rate_hz': planner_check_rate_hz,
+            'prehook_replan_deviation_m': replan_deviation_m,
+            'prehook_replan_deviation_hold_s': (
+                replan_deviation_hold_s
+            ),
+            'prehook_replan_min_switch_interval_s': (
+                replan_min_switch_interval_s
+            ),
+            'prehook_replan_min_improvement_m': (
+                replan_min_improvement_m
+            ),
+            'prehook_replan_min_improvement_ratio': (
+                replan_min_improvement_ratio
+            ),
+            'prehook_replan_optimization_period_s': (
+                replan_optimization_period_s
+            ),
+            'prehook_reached_hold_s': prehook_reached_hold_s,
+            'prehook_attitude_reference_mode': (
+                prehook_attitude_reference_mode
+            ),
+            'prehook_reached_orientation_tol_rad': math.radians(
+                prehook_reached_orientation_tol_deg
+            ),
+            'prehook_reached_forward_axis_tol_rad': math.radians(
+                prehook_reached_forward_axis_tol_deg
+            ),
+            'prehook_reached_yaw_tol_rad': math.radians(
+                prehook_reached_yaw_tol_deg
+            ),
+            'fixed_hook_line_yaw_tol_rad': math.radians(
+                fixed_hook_line_yaw_tol_deg
+            ),
+            'fixed_hook_line_position_mode': (
+                fixed_hook_line_position_mode
+            ),
+            'fixed_hook_line_cross_track_tol_m': (
+                fixed_hook_line_cross_track_tol_m
+            ),
+            'fixed_hook_line_interlock_release_ratio': (
+                fixed_hook_line_interlock_release_ratio
+            ),
+            'fixed_hook_line_max_reference_lead_m': (
+                fixed_hook_line_max_reference_lead_m
+            ),
+            'fixed_hook_line_velocity_weight_multiplier': (
+                fixed_hook_line_velocity_weight_multiplier
+            ),
+            'prehook_attitude_wait_exit_hysteresis_ratio': (
+                prehook_attitude_wait_exit_hysteresis_ratio
+            ),
+            'prehook_attitude_alignment_timeout_s': (
+                prehook_attitude_alignment_timeout_s
+            ),
+            'prehook_static_obstacles_ned_xyxy': static_obstacles_text,
+            'astar_resolution': astar_resolution,
+            'astar_robot_radius': astar_robot_radius,
+            'astar_obstacle_margin': astar_obstacle_margin,
+            'astar_diagonal_motion': True,
+            'prehook_path_smoothing_iterations': smoothing_iterations,
+            'prehook_path_smoothing_corner_fraction': (
+                smoothing_corner_fraction
+            ),
+            'prehook_path_smoothing_samples_per_corner': (
+                smoothing_samples
+            ),
             'use_box_recovery_mission': False,
             'Ts': 0.04,
             'N': 25,
@@ -998,6 +1477,8 @@ def _launch_setup(context, *args, **kwargs):
             'stage': 'fixed_hook_pose_validation',
             'target_config': str(target_path),
             'target_source_topic': payload.get('source_topic', ''),
+            'target_live_pose_topic': raw_pose_topic,
+            'target_provenance': target_provenance,
             'target_frame_id': payload.get('frame_id', ''),
             'target_correction_applied': target_correction_applied,
             'orientation_correction_quat_xyzw': correction_xyzw.tolist(),
@@ -1026,6 +1507,165 @@ def _launch_setup(context, *args, **kwargs):
             ),
             'pre_approach_forward_yaw_rad': goal_yaw,
             'pre_approach_ned_m': pre_approach_position.tolist(),
+            'prehook_planner': {
+                'mode': 'astar_real_ned',
+                'active_states': [
+                    'PLAN_TO_PREHOOK',
+                    'TRACK_TO_PREHOOK',
+                ],
+                'disabled_states': [
+                    'PREHOOK_REACHED',
+                    'GO_FORWARD',
+                    'WAIT_HOOK',
+                    'GO_BACK',
+                    'COMPLETE',
+                ],
+                'check_rate_hz': planner_check_rate_hz,
+                'replan_deviation_m': replan_deviation_m,
+                'replan_deviation_hold_s': replan_deviation_hold_s,
+                'min_switch_interval_s': replan_min_switch_interval_s,
+                'min_improvement_m': replan_min_improvement_m,
+                'min_improvement_ratio': replan_min_improvement_ratio,
+                'optimization_period_s': replan_optimization_period_s,
+                'prehook_reached_hold_s': prehook_reached_hold_s,
+                'attitude_reference_mode': prehook_attitude_reference_mode,
+                'reached_orientation_tolerance_deg': (
+                    prehook_reached_orientation_tol_deg
+                ),
+                'reached_forward_axis_tolerance_deg': (
+                    prehook_reached_forward_axis_tol_deg
+                ),
+                'attitude_gate_semantics': (
+                    'full_attitude_safety_envelope_and_body_x_forward_axis_'
+                    'and_yaw'
+                ),
+                'reached_yaw_tolerance_deg': (
+                    prehook_reached_yaw_tol_deg
+                ),
+                'attitude_wait_exit_hysteresis_ratio': (
+                    prehook_attitude_wait_exit_hysteresis_ratio
+                ),
+                'attitude_wait_exit_hysteresis_semantics': (
+                    'position_depth_exit_gate_ratio'
+                ),
+                'attitude_alignment_timeout_s': (
+                    prehook_attitude_alignment_timeout_s
+                ),
+                'attitude_alignment_timeout_enabled': (
+                    prehook_attitude_alignment_timeout_s > 0.0
+                ),
+                'attitude_timeout_action': (
+                    (
+                        'latched_current_pose_hold_preserve_world_z_bias_'
+                        'keep_offboard_heartbeat'
+                    )
+                    if prehook_attitude_alignment_timeout_s > 0.0
+                    else 'continuous_nmpc_alignment_no_elapsed_timeout'
+                ),
+                'attitude_timeout_integral_semantics': (
+                    (
+                        'clear_xy_preserve_and_continue_bounded_world_z_bias'
+                    )
+                    if prehook_attitude_alignment_timeout_s > 0.0
+                    else 'not_applicable_no_timeout_transition'
+                ),
+                'resolution_m': astar_resolution,
+                'robot_radius_m': astar_robot_radius,
+                'obstacle_margin_m': astar_obstacle_margin,
+                'obstacle_inflation_m': obstacle_inflation,
+                'static_obstacles_ned_xyxy': [
+                    list(rectangle) for rectangle in static_obstacles
+                ],
+                'static_obstacle_semantics': 'no_contact_all_mission_phases',
+                'fixed_hook_corridor_collision_validated': True,
+                'bounds_semantics': (
+                    'already_margin_reduced_center_feasible_ned'
+                ),
+                'failure_policy': 'revoke_mission_no_linear_fallback',
+                'dynamic_obstacle_feed': False,
+            },
+            'fixed_hook_line_interlock': {
+                'enabled': not fixed_hook_line_position_mode,
+                'control_mode': (
+                    'position_like_time_parameterized_ned'
+                    if fixed_hook_line_position_mode
+                    else 'measured_progress_interlock_compatibility'
+                ),
+                'active_states': (
+                    []
+                    if fixed_hook_line_position_mode
+                    else ['GO_FORWARD', 'GO_BACK']
+                ),
+                'progress_source': (
+                    'monotonic_trajectory_time'
+                    if fixed_hook_line_position_mode
+                    else 'measured_along_track_position'
+                ),
+                'progress_semantics': (
+                    'direct_to_endpoint_no_freeze_no_rewind'
+                    if fixed_hook_line_position_mode
+                    else 'monotonic_furthest_measured_progress_no_reverse'
+                ),
+                'yaw_tolerance_deg': fixed_hook_line_yaw_tol_deg,
+                'cross_track_tolerance_m': (
+                    fixed_hook_line_cross_track_tol_m
+                ),
+                'release_ratio': (
+                    fixed_hook_line_interlock_release_ratio
+                ),
+                'depth_tolerance_m': fixed_hook_depth_tolerance,
+                'maximum_reference_lead_m': (
+                    None
+                    if fixed_hook_line_position_mode
+                    else fixed_hook_line_max_reference_lead_m
+                ),
+                'maximum_reference_lead_semantics': (
+                    'not_used_by_time_parameterized_position_mode'
+                    if fixed_hook_line_position_mode
+                    else (
+                        'new_forward_advancement_only_'
+                        'no_retreat_anchor_may_hold'
+                    )
+                ),
+                'velocity_weight_multiplier': (
+                    fixed_hook_line_velocity_weight_multiplier
+                ),
+                'velocity_weight_scope': (
+                    'GO_FORWARD_GO_BACK_world_ned_velocity'
+                ),
+                'velocity_reference_frame': 'ned',
+                'depth_velocity_reference_mps': 0.0,
+                'interlocked_velocity_weight_multiplier': (
+                    None if fixed_hook_line_position_mode else 1.0
+                ),
+                'interlocked_velocity_weight_semantics': (
+                    'not_applicable_interlock_disabled'
+                    if fixed_hook_line_position_mode
+                    else 'base_weight_allows_cross_track_depth_yaw_recovery'
+                ),
+                'outside_tolerance_action': (
+                    'continue_translation_and_correct_all_axes_with_nmpc'
+                    if fixed_hook_line_position_mode
+                    else (
+                        'freeze_forward_lead_at_furthest_station_and_realign'
+                    )
+                ),
+                'backslide_action': (
+                    'time_reference_continues_toward_endpoint_never_rewinds'
+                    if fixed_hook_line_position_mode
+                    else 'hold_furthest_station_never_rewind_to_phase_start'
+                ),
+                'cross_track_integral_semantics': (
+                    'bounded_line_normal_only_during_transit'
+                ),
+                'depth_integral_semantics': (
+                    'bounded_world_z_updated_during_transit'
+                ),
+                'along_track_integral_semantics': (
+                    'always_zero_during_transit'
+                ),
+                'reference_depth': 'recorded_hook_depth',
+            },
             'fixed_hook_depth_tolerance_m': (
                 fixed_hook_depth_tolerance
             ),
@@ -1037,6 +1677,20 @@ def _launch_setup(context, *args, **kwargs):
             'min_traj_duration_s': min_traj_duration,
             'final_pose_hold_s': final_pose_hold_s,
             'return_to_pre_approach_after_hold': True,
+            'operator_hook_confirmation': {
+                'required': True,
+                'input': 'dedicated_terminal_h_key',
+                'service': HOOK_CONFIRMATION_SERVICE,
+                'accepted_state': 'WAIT_HOOK',
+                'next_state': 'GO_BACK',
+                'automatic_timeout_s': None,
+                'minimum_wait_after_state_entry_s': 0.25,
+                'arrival_pose_latched_on_wait_entry': True,
+                'reject_if_pose_outside_tolerance': False,
+            },
+            'final_pose_hold_s_scope': (
+                'legacy_final_hold_only_not_dynamic_wait_hook'
+            ),
             'retreat_speed_mps': retreat_speed_mps,
             'angular_velocity_source_topic': (
                 px4_vehicle_odometry_topic
@@ -1105,6 +1759,7 @@ def _launch_setup(context, *args, **kwargs):
             'notes': notes,
             'odom_topic': vehicle_odom_topic,
             'mocap_odom_topic': nav_odom_topic,
+            'raw_mocap_pose_topic': raw_pose_topic,
             'cmd_vel_topic': '',
             'thrust_sp_topic': thrust_topic,
             'torque_sp_topic': torque_topic,
@@ -1180,17 +1835,76 @@ def _launch_setup(context, *args, **kwargs):
         f'{pre_approach_position[1]:.3f}, '
         f'{pre_approach_position[2]:.3f}] m, '
         f'body-forward distance={pre_approach_line_distance:.3f} m, '
-        f'depth tolerance={fixed_hook_depth_tolerance:.3f} m; the controller '
-        'will settle to the recorded attitude and common line depth before '
-        'advancing along the recorded horizontal nose direction.'
+        f'depth tolerance={fixed_hook_depth_tolerance:.3f} m; attitude '
+        f'reference={prehook_attitude_reference_mode}, pre-hook attitude '
+        f'tolerance={prehook_reached_orientation_tol_deg:.1f}deg, '
+        'body-X forward-axis tolerance='
+        f'{prehook_reached_forward_axis_tol_deg:.1f}deg, '
+        f'pre-hook yaw tolerance={prehook_reached_yaw_tol_deg:.1f}deg, '
+        f'position/depth wait-exit hysteresis='
+        f'{prehook_attitude_wait_exit_hysteresis_ratio:.2f}x. The '
+        'controller will hold the common line depth before advancing along '
+        'the recorded horizontal nose direction.'
     )
     mission_sequence_summary = (
-        'Fixed-hook pose sequence: PRE_APPROACH -> FINAL_APPROACH -> '
-        f'FINAL_HOLD({final_pose_hold_s:.1f}s) -> straight RETREAT to '
-        'PRE_APPROACH -> COMPLETE; speeds: '
+        'Fixed-hook pose sequence: PLAN_TO_PREHOOK -> TRACK_TO_PREHOOK -> '
+        f'PREHOOK_REACHED({prehook_reached_hold_s:.1f}s) -> GO_FORWARD -> '
+        'WAIT_HOOK(operator H confirmation, no automatic timeout) -> '
+        'straight GO_BACK -> '
+        'COMPLETE; speeds: '
         f'pre={pre_approach_speed:.3f}m/s, '
         f'final={final_approach_speed:.3f}m/s, '
         f'retreat={retreat_speed_mps:.3f}m/s.'
+    )
+    if fixed_hook_line_position_mode:
+        line_interlock_summary = (
+            'Fixed-hook Position-like translation: GO_FORWARD/GO_BACK use '
+            'a monotonic time-parameterized horizontal NED reference directly '
+            'to the endpoint. Ordinary yaw/cross-track/depth error does not '
+            'freeze, brake, or rewind forward progress; NMPC corrects all '
+            'axes concurrently. NED depth and depth-velocity references stay '
+            f'constant, with {fixed_hook_line_velocity_weight_multiplier:.1f}x '
+            'world-velocity weight throughout the line. Final position, '
+            'depth, and attitude acceptance gates remain active.'
+        )
+    else:
+        line_interlock_summary = (
+            'Fixed-hook compatibility interlock: GO_FORWARD/GO_BACK progress '
+            'is driven by measured along-track position; '
+            f'yaw tolerance={fixed_hook_line_yaw_tol_deg:.1f}deg, '
+            'cross-track tolerance='
+            f'{fixed_hook_line_cross_track_tol_m:.3f}m, '
+            f'depth tolerance={fixed_hook_depth_tolerance:.3f}m, '
+            'release ratio='
+            f'{fixed_hook_line_interlock_release_ratio:.2f}x, maximum lead='
+            f'{fixed_hook_line_max_reference_lead_m:.3f}m.'
+        )
+    obstacle_scope = (
+        f'{len(static_obstacles)} configured static real-NED rectangle(s)'
+        if static_obstacles
+        else 'pool walls only (no internal obstacle geometry configured)'
+    )
+    planner_summary = (
+        f'Real pre-hook A*: {planner_check_rate_hz:.1f}Hz safety/deviation '
+        f'checks, resolution={astar_resolution:.2f}m, '
+        f'inflation={obstacle_inflation:.2f}m, map={obstacle_scope}; '
+        'failure is latched with no straight-line fallback. A* stops '
+        'permanently after PREHOOK_REACHED.'
+    )
+    attitude_alignment_summary = (
+        'Pre-hook attitude alignment: no elapsed-time timeout; NMPC keeps '
+        'aligning until the '
+        f'{prehook_reached_orientation_tol_deg:.1f}-degree full-attitude '
+        'safety envelope, '
+        f'{prehook_reached_forward_axis_tol_deg:.1f}-degree body-X '
+        'forward-axis gate, and '
+        f'{prehook_reached_yaw_tol_deg:.1f}-degree yaw gate are '
+        'satisfied. Mission/odom/Offboard/solver safety gates remain active.'
+        if prehook_attitude_alignment_timeout_s <= 0.0
+        else (
+            'Pre-hook attitude alignment timeout: '
+            f'{prehook_attitude_alignment_timeout_s:.1f}s.'
+        )
     )
     rate_feedback_summary = (
         'Attitude-rate damping uses PX4 BODY_FRD angular velocity from '
@@ -1226,6 +1940,9 @@ def _launch_setup(context, *args, **kwargs):
         LogInfo(msg=target_summary),
         LogInfo(msg=pre_approach_summary),
         LogInfo(msg=mission_sequence_summary),
+        LogInfo(msg=line_interlock_summary),
+        LogInfo(msg=planner_summary),
+        LogInfo(msg=attitude_alignment_summary),
         LogInfo(msg=rate_feedback_summary),
         LogInfo(msg=position_integral_summary),
         LogInfo(msg=px4_msgs_summary),
@@ -1240,7 +1957,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'rigid_body_name',
-            default_value='glub_fb',
+            default_value='glub',
             description='MoCap rigid-body name used under /mocap.',
         ),
         DeclareLaunchArgument(
@@ -1252,12 +1969,20 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'target_config',
-            default_value=(
-                '/home/yecheng/bluerov_ws/src/bluerov2_control/'
-                'experiments/payload_retrieval/config/'
-                'hooked_box_target_pose_20260802_195146.json'
+            default_value='unconfigured',
+            description=(
+                'Required validated glub target recorded directly from '
+                '/mocap/glub/pose at the hooked pose. The former glub_fb '
+                'recording is retained as provenance and is not relabelled.'
             ),
-            description='Validated glub_fb target recorded at the hooked pose.',
+        ),
+        DeclareLaunchArgument(
+            'allow_identity_derived_target',
+            default_value='false',
+            description=(
+                'Allow only a hash-locked, exact identity pose transfer from '
+                'another raw MoCap rigid body. Disabled by default.'
+            ),
         ),
         DeclareLaunchArgument(
             'mocap_world_frame',
@@ -1315,6 +2040,200 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('min_traj_duration_s', default_value='5.0'),
         DeclareLaunchArgument(
+            'prehook_planner_check_rate_hz',
+            default_value='2.0',
+            description=(
+                'Low-rate path safety/deviation checker; valid range 2-5 Hz.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_replan_deviation_m',
+            default_value='0.30',
+            description='Cross-track error that may trigger a new A* path.',
+        ),
+        DeclareLaunchArgument(
+            'prehook_replan_deviation_hold_s',
+            default_value='0.50',
+            description='Time the cross-track threshold must remain exceeded.',
+        ),
+        DeclareLaunchArgument(
+            'prehook_replan_min_switch_interval_s',
+            default_value='1.0',
+            description='Replan switching cooldown to prevent path chatter.',
+        ),
+        DeclareLaunchArgument(
+            'prehook_replan_min_improvement_m',
+            default_value='0.15',
+            description='Absolute path shortening required for optional switch.',
+        ),
+        DeclareLaunchArgument(
+            'prehook_replan_min_improvement_ratio',
+            default_value='0.10',
+            description='Relative path shortening required for optional switch.',
+        ),
+        DeclareLaunchArgument(
+            'prehook_replan_optimization_period_s',
+            default_value='2.0',
+            description=(
+                'Period for checking whether a materially shorter path exists; '
+                '0 disables optimization-only searches.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_reached_hold_s',
+            default_value='1.0',
+            description=(
+                'Continuous position/depth/attitude dwell before GO_FORWARD.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_attitude_reference_mode',
+            default_value='recorded_hook',
+            description=(
+                'Pre-hook attitude reference: recorded_hook preserves the '
+                'legacy full Hook attitude; capture_start_trim captures the '
+                'free-floating start roll/pitch while retaining target yaw.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_reached_orientation_tol_deg',
+            default_value='5.0',
+            description=(
+                'Full attitude tolerance at PREHOOK_REACHED in degrees '
+                '(1-20). Hook and WAIT_HOOK retain the separate 5-degree '
+                'goal tolerance.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_reached_forward_axis_tol_deg',
+            default_value='5.0',
+            description=(
+                'Body-X (nose) forward-axis angular tolerance at '
+                'PREHOOK_REACHED in degrees (0.5-20). This remains '
+                'independent when the full-attitude safety envelope is '
+                'widened for a measured free-floating roll trim.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_reached_yaw_tol_deg',
+            default_value='3.0',
+            description=(
+                'Independent horizontal-heading tolerance before GO_FORWARD '
+                'in degrees (0.5-20). This stays strict even when the full '
+                'Splash trim-attitude tolerance is wider.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'fixed_hook_line_position_mode',
+            default_value='true',
+            description=(
+                'Use monotonic time-parameterized NED Position-like '
+                'translation for GO_FORWARD/GO_BACK. Ordinary corridor '
+                'error is corrected without freezing, braking, or rewinding.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'fixed_hook_line_yaw_tol_deg',
+            default_value='3.0',
+            description=(
+                'Compatibility-interlock heading threshold when '
+                'fixed_hook_line_position_mode=false (0.5-20 degrees).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'fixed_hook_line_cross_track_tol_m',
+            default_value='0.03',
+            description=(
+                'Compatibility-interlock horizontal cross-track threshold '
+                'when fixed_hook_line_position_mode=false (0.005-0.20 m).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'fixed_hook_line_interlock_release_ratio',
+            default_value='0.8',
+            description=(
+                'Compatibility fraction of the yaw, cross-track, and depth '
+                'thresholds that must be recovered before a frozen '
+                'GO_FORWARD/GO_BACK interlock releases (0-1, exclusive '
+                'of 0).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'fixed_hook_line_max_reference_lead_m',
+            default_value='0.02',
+            description=(
+                'Compatibility maximum along-track advancement beyond measured '
+                'progress during GO_FORWARD/GO_BACK. After a backslide, the '
+                'no-retreat anchor may remain farther ahead while the '
+                'vehicle catches up (0.005-0.20 m).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'fixed_hook_line_velocity_weight_multiplier',
+            default_value='20.0',
+            description=(
+                'Multiplier for the NMPC NED/world linear-velocity error '
+                'during GO_FORWARD/GO_BACK (1-50). Position-like mode keeps '
+                'this weight constant, including for zero depth velocity.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_attitude_wait_exit_hysteresis_ratio',
+            default_value='1.5',
+            description=(
+                'Ratio applied to the pre-hook position/depth tolerances '
+                'before leaving attitude-only wait, preventing gate chatter '
+                'while attitude settles (1-3).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_attitude_alignment_timeout_s',
+            default_value='0.0',
+            description=(
+                'Optional timeout after the pre-hook position/depth gates '
+                'are continuously satisfied but attitude is not. Zero '
+                'disables elapsed-time timeout and keeps NMPC aligning; a '
+                'positive value latches the guarded current-pose hold after '
+                'that duration. Timing starts after the reference finishes.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_static_obstacles_ned_xyxy',
+            default_value='',
+            description=(
+                'Optional semicolon-separated real-NED no-contact obstacle '
+                'rectangles: xmin xmax ymin ymax. They must not intersect '
+                'the fixed hook corridor. Empty means pool walls only.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_astar_resolution_m', default_value='0.10'
+        ),
+        DeclareLaunchArgument(
+            'prehook_robot_radius_m',
+            default_value='0.20',
+            description=(
+                'Horizontal collision radius of the real vehicle plus hook.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_obstacle_margin_m',
+            default_value='0.05',
+            description=(
+                'Extra XY obstacle clearance; robot radius plus this value '
+                'must not exceed pool_safety_margin_m.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'prehook_path_smoothing_iterations', default_value='1'
+        ),
+        DeclareLaunchArgument(
+            'prehook_path_smoothing_corner_fraction', default_value='0.20'
+        ),
+        DeclareLaunchArgument(
+            'prehook_path_smoothing_samples_per_corner', default_value='4'
+        ),
+        DeclareLaunchArgument(
             'pre_approach_distance_m',
             default_value='0.50',
             description=(
@@ -1340,8 +2259,9 @@ def generate_launch_description():
             'final_pose_hold_s',
             default_value='5.0',
             description=(
-                'Continuous in-tolerance hold at the recorded hook pose '
-                'before retreating.'
+                'Legacy FINAL_HOLD duration. The real dynamic WAIT_HOOK '
+                'stage ignores this timer and requires operator H '
+                'confirmation before retreating.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1381,8 +2301,11 @@ def generate_launch_description():
             'position_integral_gain_N_per_m_s',
             default_value='3.0',
             description=(
-                'Bounded offset-free position gain, enabled only after the '
-                'nominal reference finishes.'
+                'Bounded offset-free position gain. Normal trajectories '
+                'enable it after the reference finishes; fixed Hook '
+                'transit additionally updates its line-normal cross-current '
+                'and world-Z depth components while forcing the along-line '
+                'component to zero.'
             ),
         ),
         DeclareLaunchArgument(

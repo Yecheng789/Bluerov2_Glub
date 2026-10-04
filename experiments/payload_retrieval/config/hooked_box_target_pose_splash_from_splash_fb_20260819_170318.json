@@ -1,0 +1,46 @@
+{
+  "description": "Hash-locked identity transfer of the validated Splash Hook target after the Qualisys rigid body was renamed from splash_fb to splash.",
+  "frame_id": "mocap",
+  "message_type": "geometry_msgs/PoseStamped",
+  "source_topic": "/mocap/splash_fb/pose",
+  "target_pose": {
+    "orientation_xyzw": {
+      "w": 0.007876660795138598,
+      "x": -0.08546681472498348,
+      "y": -0.05861793580480719,
+      "z": 0.994583993133545
+    },
+    "position": {
+      "x": 4.31534418334961,
+      "y": -0.12102047066688537,
+      "z": 1.7312444885253906
+    }
+  },
+  "notes": [
+    "The source recording remains unmodified and retains its original /mocap/splash_fb/pose provenance.",
+    "The operator confirmed that only the Qualisys rigid-body name changed.",
+    "Marker definition, rigid-body origin, axes, mounting, and fixed Hook target pose are unchanged.",
+    "No position or orientation transform is applied."
+  ],
+  "derived_target": {
+    "schema_version": 1,
+    "type": "identity_pose_transfer",
+    "source_config": "hooked_box_target_pose_splash_20260819_170318.json",
+    "source_config_sha256": "9237d8460432c0e897713057ac2d3d5c046c9f449b7389a5b35c647341367f3c",
+    "source_pose_topic": "/mocap/splash_fb/pose",
+    "destination_pose_topic": "/mocap/splash/pose",
+    "position_offset_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "orientation_offset_xyzw": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "operator_confirmed_equivalent_geometry": true,
+    "operator_confirmed_same_target_pose": true
+  }
+}

@@ -415,7 +415,7 @@ def parse_args(argv=None) -> Tuple[argparse.Namespace, Sequence[str]]:
     parser = argparse.ArgumentParser(
         description="Average MoCap samples and save a target pose JSON file."
     )
-    parser.add_argument("--topic", default="/mocap/glub_fb/pose")
+    parser.add_argument("--topic", default="/mocap/glub/pose")
     parser.add_argument(
         "--message-type", choices=["odom", "pose"], default="pose"
     )

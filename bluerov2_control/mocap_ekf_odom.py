@@ -447,7 +447,7 @@ class MocapEkfOdom(Node):
     def __init__(self):
         super().__init__("mocap_ekf_odom")
 
-        self.declare_parameter("rigid_body_name", "glub_fb")
+        self.declare_parameter("rigid_body_name", "glub")
         rigid_body_name = str(self.get_parameter("rigid_body_name").value)
 
         self.declare_parameter("pose_topic", "")
@@ -566,6 +566,14 @@ class MocapEkfOdom(Node):
         self._last_pose_header_stamp_ns = None
         self._consecutive_full_rejections = 0
         self._imu_gyro_lpf = None
+        # A coast timeout is different from a normal first startup.  Once the
+        # filter has produced trusted odometry, never discard that continuity
+        # information and then accept an arbitrary finite pose as a new
+        # origin.  Retain the last measurement-corrected state as an anchor
+        # and require innovation-gated recovery around it.
+        self._last_trusted_filter_snapshot = None
+        self._tracking_loss_latched = False
+        self._tracking_loss_started_sec = None
 
         input_qos = QoSProfile(
             depth=10,
@@ -693,7 +701,9 @@ class MocapEkfOdom(Node):
                 return
             self._last_pose_header_stamp_ns = stamp_ns
 
-        self._predict_to(now)
+        if self._tracking_loss_due(now):
+            self._enter_tracking_loss_latch(now)
+
         quaternion_norm = float(np.linalg.norm(orientation))
         if (
             not all_finite(position, orientation)
@@ -709,11 +719,16 @@ class MocapEkfOdom(Node):
                 orientation,
                 self._orientation_correction,
             )
-            accepted = self._filter.update_pose(position, orientation)
+            accepted = self._update_filter_from_pose(
+                position,
+                orientation,
+                now,
+            )
         self._handle_update_result(accepted, position, orientation)
         self._last_pose_rx_sec = now
         if accepted:
             self._last_pose_accepted_sec = now
+            self._record_trusted_filter_anchor()
 
         if frame_id and frame_id != self._parent_frame:
             self.get_logger().warn(
@@ -734,7 +749,11 @@ class MocapEkfOdom(Node):
         )
 
     def _imu_cb(self, msg):
-        if not self._use_imu_gyro or not self._filter.initialized:
+        if (
+            not self._use_imu_gyro
+            or not self._filter.initialized
+            or self._tracking_loss_latched
+        ):
             return
 
         frame_id = msg.header.frame_id
@@ -796,6 +815,14 @@ class MocapEkfOdom(Node):
             throttle_duration_sec=1.0,
         )
 
+        # A tracking-loss latch must only be cleared by a pose that passes the
+        # retained anchor's normal innovation gates.  In particular, the
+        # generic repeated-rejection reinitializer below must not erase the
+        # anchor and turn a persistent wrong rigid-body solution into valid
+        # odometry.
+        if self._tracking_loss_latched:
+            return
+
         if (
             self._max_rejected_samples <= 0
             or self._consecutive_full_rejections < self._max_rejected_samples
@@ -839,6 +866,97 @@ class MocapEkfOdom(Node):
             self._filter.predict(now - self._last_filter_sec)
         self._last_filter_sec = now
 
+    def _record_trusted_filter_anchor(self):
+        """Save the latest measurement-corrected state for safe recovery."""
+        if not self._filter.initialized:
+            return
+        self._last_trusted_filter_snapshot = self._filter._snapshot()
+
+    def _tracking_loss_due(self, now):
+        if self._tracking_loss_latched or not self._filter.initialized:
+            return False
+        if self._max_coast_sec <= 0.0:
+            return False
+        if self._last_pose_accepted_sec is None:
+            return False
+        return (
+            float(now) - self._last_pose_accepted_sec
+        ) > self._max_coast_sec
+
+    def _enter_tracking_loss_latch(self, now, reason=None):
+        """Stop prediction/publication while preserving a recovery anchor."""
+        if self._tracking_loss_latched:
+            return
+
+        snapshot = self._last_trusted_filter_snapshot
+        if snapshot is not None:
+            self._filter._restore(snapshot)
+        else:
+            # This should only be reachable for a corrupted/manually-created
+            # initialized filter.  Without a trusted anchor, fail closed and
+            # require a node restart rather than accepting an unconstrained
+            # pose while the tracking-loss latch is active.
+            self._filter = self._filter.reset_copy()
+        self._tracking_loss_latched = True
+        self._tracking_loss_started_sec = float(now)
+        # No prediction is allowed across the unobserved interval.  A valid
+        # recovery pose resets this timestamp before publication resumes.
+        self._last_filter_sec = None
+        self._imu_gyro_lpf = None
+        accepted_age_sec = (
+            float(now) - self._last_pose_accepted_sec
+            if self._last_pose_accepted_sec is not None
+            else float("inf")
+        )
+        if reason is None:
+            reason = (
+                "no accepted pose for "
+                f"{accepted_age_sec:.3f}s"
+            )
+        self.get_logger().warn(
+            f"MoCap tracking lost: {reason}. Odometry publication is "
+            "latched off; the last trusted state is retained for "
+            "innovation-gated recovery."
+        )
+
+    def _update_filter_from_pose(self, position, orientation, now):
+        """Apply a pose normally or recover it against the trusted anchor."""
+        if not self._tracking_loss_latched:
+            self._predict_to(now)
+            return self._filter.update_pose(position, orientation)
+
+        if not self._filter.initialized:
+            self._filter.last_pose_rejection_reason = (
+                "tracking-loss continuity anchor is unavailable"
+            )
+            return False
+
+        orientation = quat_normalize(orientation)
+        accepted, _position_residual, _attitude_residual = (
+            self._filter._check_pose_measurement(position, orientation)
+        )
+        if not accepted:
+            return False
+
+        # The pose has passed the same innovation and tilt gates used during
+        # normal tracking.  Start a fresh covariance/velocity state at this
+        # nearby measurement rather than integrating an unobserved, long dt.
+        self._filter.initialize(position, orientation)
+        self._last_filter_sec = float(now)
+        loss_duration_sec = (
+            float(now) - self._tracking_loss_started_sec
+            if self._tracking_loss_started_sec is not None
+            else 0.0
+        )
+        self._tracking_loss_latched = False
+        self._tracking_loss_started_sec = None
+        self.get_logger().warn(
+            "MoCap tracking recovered after "
+            f"{max(0.0, loss_duration_sec):.3f}s; pose passed retained-anchor "
+            "innovation gates and odometry publication may resume."
+        )
+        return True
+
     def _reset_filter(self):
         self._filter = self._filter.reset_copy()
         self._last_filter_sec = None
@@ -846,24 +964,38 @@ class MocapEkfOdom(Node):
         self._last_pose_accepted_sec = None
         self._consecutive_full_rejections = 0
         self._imu_gyro_lpf = None
+        self._last_trusted_filter_snapshot = None
+        self._tracking_loss_latched = False
+        self._tracking_loss_started_sec = None
 
     def _tick(self):
-        if not self._filter.initialized or self._last_filter_sec is None:
+        if not self._filter.initialized or self._tracking_loss_latched:
+            return
+        if self._last_filter_sec is None:
             return
 
         now = self._now_sec()
-        if (
-            self._last_pose_accepted_sec is not None
-            and (now - self._last_pose_accepted_sec) > self._max_coast_sec
-        ):
-            self._reset_filter()
-            self.get_logger().warn(
-                "MoCap coasting for too long; waiting for next valid pose.",
-                throttle_duration_sec=1.0,
+        if self._tracking_loss_due(now):
+            self._enter_tracking_loss_latch(now)
+            return
+        self._predict_to(now)
+
+        if not self._filter._orientation_z_safe():
+            z_axis_angle_rad = base_link_z_axis_angle_rad(
+                self._filter.orientation
+            )
+            max_z_axis_angle_rad = (
+                self._filter.max_base_link_z_axis_angle_rad
+            )
+            self._enter_tracking_loss_latch(
+                now,
+                reason=(
+                    "predicted EKF orientation is unsafe "
+                    f"(base_link_z_axis_angle={z_axis_angle_rad:.3f}rad > "
+                    f"{max_z_axis_angle_rad:.3f}rad)"
+                ),
             )
             return
-
-        self._predict_to(now)
 
         stamp = self.get_clock().now().to_msg()
         odom_msg = self._odom_message(stamp)

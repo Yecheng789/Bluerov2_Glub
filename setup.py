@@ -55,6 +55,8 @@ setup(
             'offboard_enable = bluerov2_control.offboard_enable:main',
             'wasd_teleop = bluerov2_control.wasd_teleop:main',
             'keyboard_cmd_vel = bluerov2_control.keyboard_cmd_vel:main',
+            'confirm_hook_keyboard = '
+            'bluerov2_control.confirm_hook_keyboard:main',
         ],
     },
 )

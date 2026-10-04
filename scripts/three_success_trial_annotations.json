@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "description": "Controller-state timestamps used to align the three operator-confirmed successful Splash retrieval experiments for paper figures.",
+  "timestamp_provenance": {
+    "method": "Controller transition messages were matched to sample time_ros_s; events.csv contains logger start/stop only.",
+    "evidence_file": "three_success_controller_event_evidence.txt"
+  },
+  "trials": [
+    {
+      "directory": "retrieval_box_near_the_front_success",
+      "short_label": "Near-front",
+      "panel_label": "(a)",
+      "trial_id": "retrieval_20260830_163314_149908",
+      "controller_log": "/home/yecheng/.ros/log/python3_67408_1788100394397.log",
+      "controller_log_sha256": "4552248ed306cc664beb56ea6c250d2012ca00c50d97396895ed28fed8c01d88",
+      "mission_enable_ros_s": 1788100404.5821528,
+      "track_to_prehook_ros_s": 1788100404.6569176,
+      "prehook_reached_ros_s": 1788100458.1370554,
+      "go_forward_ros_s": 1788100459.1392834,
+      "wait_hook_ros_s": 1788100494.456373,
+      "go_back_ros_s": 1788100515.657286,
+      "analysis_end_ros_s": 1788100555.256375,
+      "analysis_end_reason": "controller_complete",
+      "controller_complete": true,
+      "operator_confirmed_physical_success": true
+    },
+    {
+      "directory": "retrieval_right_side_of_the_box_success",
+      "short_label": "Right-side",
+      "panel_label": "(b)",
+      "trial_id": "retrieval_20260830_183857_858180",
+      "controller_log": "/home/yecheng/.ros/log/python3_128824_1788107938088.log",
+      "controller_log_sha256": "74ee1102d810547eaa50ee6fbfdd073eb49417d5f040a7a32db38cb271dd22ae",
+      "mission_enable_ros_s": 1788107946.6479914,
+      "track_to_prehook_ros_s": 1788107946.7002947,
+      "prehook_reached_ros_s": 1788107988.899818,
+      "go_forward_ros_s": 1788107989.9420092,
+      "wait_hook_ros_s": 1788108034.73962,
+      "go_back_ros_s": 1788108053.7815495,
+      "analysis_end_ros_s": 1788108115.0203557,
+      "analysis_end_reason": "controller_complete",
+      "controller_complete": true,
+      "operator_confirmed_physical_success": true
+    },
+    {
+      "directory": "retrieval_directly_in_front_of_the_box_success",
+      "short_label": "Direct-front",
+      "panel_label": "(c)",
+      "trial_id": "retrieval_20260831_110205_819617",
+      "controller_log": "/home/yecheng/.ros/log/python3_47011_1788166926020.log",
+      "controller_log_sha256": "b834bed2c12d15300d9599b1881337f460b1a100904db1f6943a60594c16371b",
+      "mission_enable_ros_s": 1788166936.3099437,
+      "track_to_prehook_ros_s": 1788166936.3769865,
+      "prehook_reached_ros_s": 1788166997.057852,
+      "go_forward_ros_s": 1788166998.0983257,
+      "wait_hook_ros_s": 1788167237.2576442,
+      "go_back_ros_s": 1788167295.0580633,
+      "analysis_end_ros_s": 1788167393.5363796,
+      "analysis_end_reason": "odometry_stale_after_mocap_loss",
+      "controller_complete": false,
+      "operator_confirmed_physical_success": true
+    }
+  ]
+}

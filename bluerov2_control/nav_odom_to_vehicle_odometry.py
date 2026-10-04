@@ -155,10 +155,10 @@ class NavOdomToVehicleOdometry(Node):
     def __init__(self):
         super().__init__("nav_odom_to_vehicle_odometry")
 
-        self.declare_parameter("input_odom_topic", "/mocap/glub_fb/odom_ekf")
+        self.declare_parameter("input_odom_topic", "/mocap/glub/odom_ekf")
         self.declare_parameter(
             "output_vehicle_odometry_topic",
-            "/mocap/glub_fb/vehicle_odometry_ekf",
+            "/mocap/glub/vehicle_odometry_ekf",
         )
         self.declare_parameter("pose_frame", "frd")
         self.declare_parameter("velocity_frame", "body_frd")

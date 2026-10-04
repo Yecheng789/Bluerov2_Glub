@@ -139,6 +139,7 @@ SAMPLE_FIELDS = (
     ]
     + _odom_fields("odom")
     + _odom_fields("mocap")
+    + _pose_fields("raw_mocap")
     + _twist_fields("cmd")
     + _xyz_fields("thrust")
     + _xyz_fields("torque")
@@ -213,6 +214,7 @@ class PayloadRetrievalDataLogger(Node):
 
         self.declare_parameter("odom_topic", "/itrl_rov_1/fmu/out/vehicle_odometry")
         self.declare_parameter("mocap_odom_topic", "")
+        self.declare_parameter("raw_mocap_pose_topic", "")
         self.declare_parameter("cmd_vel_topic", "/itrl_rov_1/cmd_vel")
         self.declare_parameter("thrust_sp_topic", "/itrl_rov_1/fmu/in/vehicle_thrust_setpoint")
         self.declare_parameter("torque_sp_topic", "/itrl_rov_1/fmu/in/vehicle_torque_setpoint")
@@ -288,6 +290,7 @@ class PayloadRetrievalDataLogger(Node):
         topic_params = [
             "odom_topic",
             "mocap_odom_topic",
+            "raw_mocap_pose_topic",
             "cmd_vel_topic",
             "thrust_sp_topic",
             "torque_sp_topic",
@@ -351,6 +354,12 @@ class PayloadRetrievalDataLogger(Node):
 
         self._subscribe("odom", self._topic_param("odom_topic"), VehicleOdometry, px4_qos)
         self._subscribe("mocap", self._topic_param("mocap_odom_topic"), Odometry, general_qos)
+        self._subscribe(
+            "raw_mocap",
+            self._topic_param("raw_mocap_pose_topic"),
+            PoseStamped,
+            general_qos,
+        )
         self._subscribe("cmd", self._topic_param("cmd_vel_topic"), Twist, general_qos)
         self._subscribe("thrust", self._topic_param("thrust_sp_topic"), VehicleThrustSetpoint, px4_qos)
         self._subscribe("torque", self._topic_param("torque_sp_topic"), VehicleTorqueSetpoint, px4_qos)
@@ -466,6 +475,7 @@ class PayloadRetrievalDataLogger(Node):
         self._put_gate_state(row, "mission_enable", now_s)
         self._put_px4_odom(row, "odom", now_s)
         self._put_nav_odom(row, "mocap", now_s)
+        self._put_pose(row, "raw_mocap", now_s)
         self._put_twist(row, "cmd", now_s)
         self._put_xyz(row, "thrust", now_s)
         self._put_xyz(row, "torque", now_s)

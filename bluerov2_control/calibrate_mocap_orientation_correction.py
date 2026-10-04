@@ -227,7 +227,7 @@ def build_report(samples: Sequence[Quaternion], args: argparse.Namespace) -> str
         "Test command:",
         (
             "ros2 launch bluerov2_control mocap_ekf_odom.launch.py "
-            "rigid_body_name:=glub_fb "
+            "rigid_body_name:=glub "
             "orientation_correction_quat_xyzw:="
             f"\"{q_correction[0]:.16g} {q_correction[1]:.16g} "
             f"{q_correction[2]:.16g} {q_correction[3]:.16g}\""
@@ -240,7 +240,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Estimate orientation_correction_quat_xyzw from raw MoCap pose."
     )
-    parser.add_argument("--topic", default="/mocap/glub_fb/pose")
+    parser.add_argument("--topic", default="/mocap/glub/pose")
     parser.add_argument("--samples", type=int, default=120)
     parser.add_argument("--min-samples", type=int, default=40)
     parser.add_argument("--cluster-angle-deg", type=float, default=20.0)
